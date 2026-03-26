@@ -1,15 +1,16 @@
 import json
 import time
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from ollama import Client
 from graph.brain import (Brain, Node, Edge, EdgeType, EdgeSource,
                          NodeStatus, NodeType, ANALOGY_WEIGHTS)
+from config import THRESHOLDS
+from embedding import embed as shared_embed
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SIMILARITY_THRESHOLD  = 0.80
-WEAK_EDGE_THRESHOLD   = 0.60
+SIMILARITY_THRESHOLD  = THRESHOLDS.MERGE_NODE
+WEAK_EDGE_THRESHOLD   = THRESHOLDS.WEAK_EDGE
 OLLAMA_MODEL          = "llama3.1:8b"
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -148,21 +149,21 @@ class Ingestor:
     def __init__(self, brain: Brain, research_agenda=None):
         self.brain            = brain
         self.llm              = Client()
-        self.embedder         = SentenceTransformer('all-MiniLM-L6-v2')
         self._embedding_cache = {}
         self.research_agenda  = research_agenda
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.7) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
     def _embed(self, text: str) -> np.ndarray:
         if text in self._embedding_cache:
             return self._embedding_cache[text]
-        emb = self.embedder.encode(text, normalize_embeddings=True)
+        emb = shared_embed(text)
         self._embedding_cache[text] = emb
         return emb
 
@@ -186,10 +187,14 @@ class Ingestor:
         if not self.research_agenda:
             return
         open_items = self.research_agenda.get_prioritized_questions(20)
+        node_emb = self._embed(statement)
         for item in open_items:
+            item_emb = self._embed(item.text)
+            if self._cosine(node_emb, item_emb) < THRESHOLDS.AGENDA_PREFILTER:
+                continue
             raw = self._llm(ANSWER_MATCH_PROMPT.format(
                 question=item.text, candidate=statement
-            ))
+            ), temperature=0.1)
             try:
                 result      = json.loads(raw)
                 match       = result.get('match', 'none')
@@ -226,7 +231,7 @@ class Ingestor:
         raw = self._llm(MISSION_RELEVANCE_PROMPT.format(
             mission   = mission['question'],
             statement = statement
-        ))
+        ), temperature=0.1)
         try:
             result = json.loads(raw)
             if result.get('relevant') and result.get('strength', 0) > 0.4:
@@ -250,7 +255,7 @@ class Ingestor:
             statements = json.loads(raw)
         except json.JSONDecodeError:
             print(f"  Node extraction parse error")
-            return
+            return []
 
         print(f"  Extracted {len(statements)} candidate nodes")
 
@@ -345,6 +350,7 @@ class Ingestor:
 
         print(f"\n── Ingestion complete. {self.brain.stats()['nodes']} nodes, "
               f"{self.brain.stats()['edges']} edges ──\n")
+        return new_node_ids
 
     def _process_statement(self, stmt: str, existing_embeddings: dict,
                            source: EdgeSource, node_type: NodeType,
@@ -382,15 +388,17 @@ class Ingestor:
         ).strip().lower()
 
         status = NodeStatus.UNCERTAIN
+        contradiction_ids = []
         for nid, nemb in existing_embeddings.items():
             sim = self._cosine(stmt_emb, nemb)
-            if sim > 0.5:
+            if sim > THRESHOLDS.CONTRADICTION:
                 check = self._llm(CONTRADICTION_CHECK_PROMPT.format(
                     existing=self.brain.get_node(nid)['statement'],
                     new=stmt
-                ))
+                ), temperature=0.1)
                 if check.lower().startswith('yes'):
                     status = NodeStatus.CONTRADICTED
+                    contradiction_ids.append(nid)
                     print(f"  Contradiction with {nid[:8]}")
 
         node = Node(
@@ -404,6 +412,16 @@ class Ingestor:
         nid = self.brain.add_node(node)
         self._embedding_cache[nid] = stmt_emb
         print(f"  Created {node_type.value} [{cluster}]: {stmt}")
+        for contra_id in contradiction_ids:
+            contra_edge = Edge(
+                type         = EdgeType.CONTRADICTS,
+                narration    = "Contradiction detected during ingestion.",
+                weight       = 0.5,
+                confidence   = 0.6,
+                source       = source,
+                decay_exempt = True
+            )
+            self.brain.add_edge(nid, contra_id, contra_edge)
 
         self._check_against_agenda(nid, stmt)
         self._check_mission_relevance(nid, stmt)

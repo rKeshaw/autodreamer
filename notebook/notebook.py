@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from ollama import Client
 from graph.brain import Brain, NodeType, EdgeType
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -101,6 +102,9 @@ You are {name}, a scientist attempting to answer:
 
 Here is everything the mind has accumulated so far:
 
+Mission progress synthesis:
+{progress_summary}
+
 Most significant mission advances:
 {advances}
 
@@ -164,10 +168,11 @@ class Notebook:
         self.running_hypothesis: str = ""
         self._load()
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.6) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
@@ -285,6 +290,14 @@ class Notebook:
             return ""
 
         # top mission advances
+        progress_summary = "none yet"
+        if self.observer:
+            try:
+                progress_summary = self.observer.get_mission_progress_summary()
+            except Exception:
+                progress_summary = "none yet"
+
+        # top mission advances
         advances = sorted(
             self.observer.mission_advances,
             key=lambda a: a.strength, reverse=True
@@ -297,14 +310,19 @@ class Notebook:
         # strongest structural/isomorphic insights from recent logs
         insights = []
         try:
-            for fname in sorted(os.listdir("logs"), reverse=True)[:10]:
-                if fname.startswith("dream_") and fname.endswith(".json"):
-                    with open(f"logs/{fname}") as f:
-                        d = json.load(f)
-                    for ins in d.get("insights", []):
-                        if ins.get("depth") in ["structural", "isomorphism"]:
-                            insights.append(
-                                f"[{ins['depth']}] {ins['narration']}")
+            dream_files = [
+                fname for fname in sorted(os.listdir("logs"), reverse=True)
+                if fname.startswith("dream_cycle") and fname.endswith(".json")
+            ]
+            if not dream_files:
+                print("Notebook: no dream_cycle*.json files found for insight synthesis.")
+            for fname in dream_files[:10]:
+                with open(f"logs/{fname}") as f:
+                    d = json.load(f)
+                for ins in d.get("insights", []):
+                    if ins.get("depth") in ["structural", "isomorphism"]:
+                        insights.append(
+                            f"[{ins['depth']}] {ins['narration']}")
                 if len(insights) >= 5:
                     break
         except Exception:
@@ -335,6 +353,7 @@ class Notebook:
         self.running_hypothesis = self._llm(RUNNING_HYPOTHESIS_PROMPT.format(
             name           = self.name,
             mission        = self._mission(),
+            progress_summary = progress_summary,
             advances       = advances_text,
             insights       = insights_text,
             hypotheses     = hypotheses_text,
@@ -395,8 +414,7 @@ class Notebook:
             "running_hypothesis": self.running_hypothesis,
             "scientist_name":     self.name
         }
-        with open(NOTEBOOK_PATH, 'w') as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(NOTEBOOK_PATH, data)
 
     def _load(self):
         try:

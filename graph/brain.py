@@ -5,6 +5,7 @@ import networkx as nx
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from enum import Enum
+from persistence import atomic_write_json
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
@@ -339,10 +340,15 @@ class Brain:
 
     # ── Decay ────────────────────────────────────────────────────────────────
 
-    def apply_decay(self):
+    def apply_decay(self, elapsed_days: float = 1.0):
+        half_life_days = 1.0 / max(self.decay_rate, 1e-9)
+        decay_factor = 0.5 ** (elapsed_days / half_life_days)
         for u, v, data in self.graph.edges(data=True):
             if not data.get('decay_exempt', False):
-                data['weight'] = max(0.01, data.get('weight', 0.5) - self.decay_rate)
+                data['weight'] = max(
+                    0.01,
+                    data.get('weight', 0.5) * decay_factor
+                )
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -359,8 +365,7 @@ class Brain:
                 "scientificness": self.scientificness
             }
         }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(path, data)
         print(f"Brain saved — {len(self.graph.nodes)} nodes, "
               f"{len(self.graph.edges)} edges | mode: {self._mode.value}")
 

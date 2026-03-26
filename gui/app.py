@@ -3,8 +3,10 @@ import os
 import sys
 import time
 import queue
+import hashlib
 import threading
 from flask import Flask, jsonify, request, render_template, Response
+from persistence import atomic_write_json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
@@ -22,6 +24,7 @@ from sandbox.sandbox import Sandbox
 
 BRAIN_PATH    = "data/brain.json"
 OBSERVER_PATH = "data/observer.json"
+DAILY_LEDGER_PATH = "data/daily_new_nodes.json"
 
 app = Flask(__name__, template_folder='templates')
 state = {
@@ -34,14 +37,28 @@ state = {
 # ── Event stream ──────────────────────────────────────────────────────────────
 
 _event_queue = queue.Queue(maxsize=400)
+_dropped_events = 0
+state_lock = threading.RLock()
 
 def emit(event_type, data):
+    global _dropped_events
     try:
         _event_queue.put_nowait({
             "type": event_type, "data": data, "timestamp": time.time()
         })
     except queue.Full:
+        _dropped_events += 1
+
+
+def _restore_cycle() -> int:
+    cycle = observer.cycle_count
+    try:
+        with open("logs/cycle_log.json", "r") as f:
+            entries = json.load(f).get("entries", [])
+        cycle = max(cycle, max((e.get("cycle", 0) for e in entries), default=0))
+    except FileNotFoundError:
         pass
+    return cycle
 
 @app.route("/api/stream")
 def api_stream():
@@ -65,6 +82,7 @@ try:    brain.load(BRAIN_PATH)
 except FileNotFoundError: pass
 try:    observer.load(OBSERVER_PATH)
 except Exception: pass
+state["cycle"] = _restore_cycle()
 
 ingestor     = Ingestor(brain, research_agenda=observer)
 dreamer      = Dreamer(brain, research_agenda=observer)
@@ -75,8 +93,21 @@ sandbox      = Sandbox(brain, observer=observer)
 reader       = Reader(brain, observer=observer, notebook=notebook)
 
 def save_state():
-    brain.save(BRAIN_PATH)
-    observer.save(OBSERVER_PATH)
+    with state_lock:
+        brain.save(BRAIN_PATH)
+        observer.save(OBSERVER_PATH)
+
+def append_daily_nodes(node_ids):
+    if not node_ids:
+        return
+    os.makedirs("data", exist_ok=True)
+    try:
+        with open(DAILY_LEDGER_PATH, "r") as f:
+            existing = json.load(f)
+    except FileNotFoundError:
+        existing = []
+    merged = list(dict.fromkeys(existing + node_ids))
+    atomic_write_json(DAILY_LEDGER_PATH, merged)
 
 # ── Status ────────────────────────────────────────────────────────────────────
 
@@ -94,12 +125,17 @@ def api_status():
         "mission_advances": len(observer.mission_advances),
         "active_node_id": state["active_node_id"],
         "reading_list":   reader.stats(),
+        "dropped_events": _dropped_events,
     })
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/graph")
 def api_graph():
+    sig = f"{len(brain.graph.nodes)}-{len(brain.graph.edges)}-{brain.stats().get('edges',0)}"
+    etag = hashlib.md5(sig.encode()).hexdigest()[:8]
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status=304)
     nodes, edges = [], []
     for nid, data in brain.all_nodes():
         nodes.append({
@@ -119,7 +155,9 @@ def api_graph():
             "narration":    data.get("narration",""),
             "analogy_depth":data.get("analogy_depth",""),
         })
-    return jsonify({"nodes":nodes,"edges":edges})
+    resp = jsonify({"nodes":nodes,"edges":edges})
+    resp.headers["ETag"] = etag
+    return resp
 
 @app.route("/api/node/<node_id>")
 def api_node(node_id):
@@ -180,27 +218,36 @@ def api_mission():
                         "cycle":a.cycle} for a in advances],
     })
 
+@app.route("/api/mission/progress")
+def api_mission_progress():
+    return jsonify({
+        "summary": observer.get_mission_progress_summary()
+    })
+
 @app.route("/api/mission", methods=["POST"])
 def api_set_mission():
     data = request.json
     q    = data.get("question","").strip()
     ctx  = data.get("context","").strip()
     if not q: return jsonify({"error":"no question"}),400
-    brain.set_mission(q,ctx)
+    with state_lock:
+        brain.set_mission(q,ctx)
     save_state()
     emit("mission_set",{"question":q,"mode":brain.get_mode()})
     return jsonify({"status":"set","question":q,"mode":brain.get_mode()})
 
 @app.route("/api/mission/suspend", methods=["POST"])
 def api_suspend_mission():
-    brain.suspend_mission()
+    with state_lock:
+        brain.suspend_mission()
     save_state()
     emit("mode_change",{"mode":brain.get_mode(),"message":"Mission suspended — wandering mode"})
     return jsonify({"status":"suspended","mode":brain.get_mode()})
 
 @app.route("/api/mission/resume", methods=["POST"])
 def api_resume_mission():
-    brain.resume_mission()
+    with state_lock:
+        brain.resume_mission()
     save_state()
     emit("mode_change",{"mode":brain.get_mode(),"message":"Mission resumed — focused mode"})
     return jsonify({"status":"resumed","mode":brain.get_mode()})
@@ -231,12 +278,13 @@ def api_sandbox():
 
 @app.route("/api/sandbox/run", methods=["POST"])
 def api_sandbox_run():
-    if state["phase"] != "idle":
-        return jsonify({"error":"already running"}),409
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
+        state["phase"]="sandbox"; state["message"]="Computing..."
     hyp = request.json.get("hypothesis","").strip()
     if not hyp: return jsonify({"error":"no hypothesis"}),400
     def run():
-        state["phase"]="sandbox"; state["message"]="Computing..."
         emit("phase_change",{"phase":"sandbox","message":"Sandbox running..."})
         try:
             r = sandbox.test_hypothesis(hyp)
@@ -273,14 +321,15 @@ def api_add_reading():
 
 @app.route("/api/reading-list/absorb", methods=["POST"])
 def api_absorb_now():
-    if state["phase"] != "idle":
-        return jsonify({"error":"already running"}),409
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
+        state["phase"]="ingesting"; state["message"]="Reading..."
     data  = request.json
     entry_id = data.get("id","")
     url   = data.get("url","").strip()
 
     def run():
-        state["phase"]="ingesting"; state["message"]="Reading..."
         emit("phase_change",{"phase":"ingesting","message":"Absorbing text..."})
         try:
             if entry_id:
@@ -312,10 +361,11 @@ def api_absorb_now():
 
 @app.route("/api/reading-list/generate", methods=["POST"])
 def api_generate_reading_list():
-    if state["phase"] != "idle":
-        return jsonify({"error":"already running"}),409
-    def run():
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
         state["phase"]="ingesting"; state["message"]="Generating reading list..."
+    def run():
         try:
             added = reader.generate_reading_list()
             save_state()
@@ -329,15 +379,16 @@ def api_generate_reading_list():
 
 @app.route("/api/reading-list/absorb-text", methods=["POST"])
 def api_absorb_text():
-    if state["phase"] != "idle":
-        return jsonify({"error":"already running"}),409
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
+        state["phase"]="ingesting"; state["message"]="Absorbing text..."
     data  = request.json
     text  = data.get("text","").strip()
     title = data.get("title","Manual text").strip()
     if not text: return jsonify({"error":"no text"}),400
 
     def run():
-        state["phase"]="ingesting"; state["message"]="Absorbing text..."
         emit("phase_change",{"phase":"ingesting","message":"Absorbing text..."})
         try:
             result = reader.add_text(text, title=title)
@@ -363,7 +414,7 @@ def api_dreamlog():
     logs = []
     if os.path.exists("logs"):
         for fname in sorted(os.listdir("logs"),reverse=True):
-            if fname.startswith("dream_") and fname.endswith(".json"):
+            if fname.startswith("dream_cycle") and fname.endswith(".json"):
                 try:
                     with open(os.path.join("logs",fname)) as f:
                         d = json.load(f)
@@ -380,16 +431,22 @@ def api_dreamlog():
                         "started":  d.get("started_at",0),
                     })
                 except Exception: continue
+    if not logs:
+        app.logger.warning("No dream_cycle*.json files found for /api/dreamlog")
     return jsonify(logs[:20])
 
 # ── Controls ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/ingest", methods=["POST"])
 def api_ingest():
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
     text = request.json.get("text","").strip()
     if not text: return jsonify({"error":"no text"}),400
-    def run():
+    with state_lock:
         state["phase"]="ingesting"; state["message"]="Ingesting..."
+    def run():
         emit("phase_change",{"phase":"ingesting","message":"Ingesting..."})
         ingestor.ingest(text,source=EdgeSource.CONVERSATION)
         save_state()
@@ -410,8 +467,11 @@ def api_seed():
 
 @app.route("/api/run/<phase>", methods=["POST"])
 def api_run_phase(phase):
-    if state["phase"] != "idle":
-        return jsonify({"error":"already running"}),409
+    with state_lock:
+        if state["phase"] != "idle":
+            return jsonify({"error":"already running"}),409
+        state["phase"] = "starting"
+        state["message"] = f"Starting {phase}..."
     runners = {
         "dream":         _run_dream,
         "research":      _run_research,
@@ -456,6 +516,11 @@ def _run_dream():
             })
         observer.observe(log1)
         notebook.write_morning_entry(log1, state["cycle"])
+        for signal in observer.emergence_feed[-5:]:
+            if (signal.type == "mission_advance" and
+                    signal.cycle == observer.cycle_count):
+                notebook.write_breakthrough(signal.signal, state["cycle"])
+                break
 
         if not brain.is_wandering():
             log2 = dreamer.dream(
@@ -472,7 +537,7 @@ def _run_dream():
                     "mission_advance": getattr(step,"mission_advance",False),
                     "question": step.question, "brain_mode": brain_mode,
                 })
-            observer.observe(log2)
+            observer.observe_supplemental(log2)
 
         emit("dream_complete",{
             "cycle":      state["cycle"],
@@ -503,6 +568,7 @@ def _run_research():
         log = researcher.research_day(
             max_questions=5,
             log_path=f"logs/research_cycle{state['cycle']}.json")
+        append_daily_nodes([nid for entry in log.entries for nid in entry.node_ids])
         notebook.write_field_notes(log, state["cycle"])
         resolved = sum(1 for e in log.entries if e.resolved in ["partial","strong"])
         state["message"] = f"Research complete. {resolved} questions advanced."
@@ -526,6 +592,11 @@ def _run_reading():
             reader.generate_reading_list()
         results  = reader.reading_day(max_items=2)
         absorbed = sum(1 for r in results if r.success)
+        reading_new = [
+            nid for result in results if result.success
+            for nid in getattr(result, "node_ids", [])
+        ]
+        append_daily_nodes(reading_new)
         state["message"] = f"Reading complete. {absorbed} texts absorbed."
         emit("reading_complete",{"absorbed":absorbed,
             "summaries":[r.summary for r in results if r.success]})
@@ -542,7 +613,14 @@ def _run_consolidation():
     state["message"]= "Consolidation..."
     emit("phase_change",{"phase":"consolidating","message":"Evening consolidation..."})
     try:
+        try:
+            with open(DAILY_LEDGER_PATH, "r") as f:
+                new_node_ids = json.load(f)
+            os.remove(DAILY_LEDGER_PATH)
+        except FileNotFoundError:
+            new_node_ids = []
         report = consolidator.consolidate(
+            new_node_ids=new_node_ids,
             save_path=f"logs/consolidation_cycle{state['cycle']}.json")
         notebook.write_evening_entry(report, state["cycle"])
         notebook.update_running_hypothesis(state["cycle"])

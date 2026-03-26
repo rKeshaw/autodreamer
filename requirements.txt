@@ -1,6 +1,5 @@
 networkx
 numpy
-faiss-gpu
 sentence-transformers
 ollama
 requests

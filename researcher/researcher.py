@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from ollama import Client
 from graph.brain import Brain, EdgeSource
 from ingestion.ingestor import Ingestor
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
  
@@ -113,10 +114,11 @@ class Researcher:
         self.depth    = DEPTH_PROFILES.get(depth, DEPTH_PROFILES["standard"])
         self.log      = ResearchLog()
  
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.5) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
@@ -125,7 +127,7 @@ class Researcher:
     def _generate_queries(self, question: str, n: int) -> list:
         raw = self._llm(QUERY_GENERATION_PROMPT.format(
             question=question, n=n
-        ))
+        ), temperature=0.5)
         try:
             queries = json.loads(raw)
             return [q for q in queries if isinstance(q, str)][:n]
@@ -211,7 +213,7 @@ class Researcher:
             check = self._llm(RELEVANCE_PROMPT.format(
                 question=question,
                 text=text
-            ))
+            ), temperature=0.2)
             if not check.lower().startswith('yes'):
                 continue
  
@@ -219,7 +221,7 @@ class Researcher:
             cleaned = self._llm(EXTRACTION_QUALITY_PROMPT.format(
                 question=question,
                 text=text
-            ))
+            ), temperature=0.3)
             if cleaned.strip().upper() == "IRRELEVANT":
                 continue
  
@@ -229,13 +231,23 @@ class Researcher:
 
     # ── Research one question ─────────────────────────────────────────────────
  
-    def _research_question(self, question_text: str) -> ResearchEntry:
+    def _research_question(self, question_text: str, node_id: str = "") -> ResearchEntry:
         entry = ResearchEntry(question=question_text)
  
         print(f"\n  ── Researching: {question_text}")
  
         n_queries = self.depth["queries_per_q"]
-        queries   = self._generate_queries(question_text, n_queries)
+        context = ""
+        if node_id and self.brain.get_node(node_id):
+            neighbors = self.brain.neighbors(node_id)
+            neighbor_stmts = [
+                self.brain.get_node(n)['statement']
+                for n in neighbors[:4] if self.brain.get_node(n)
+            ]
+            if neighbor_stmts:
+                context = ("\n\nRelated concepts already in the knowledge graph:\n" +
+                           "\n".join(f"- {s}" for s in neighbor_stmts))
+        queries = self._generate_queries(question_text + context, n_queries)
         print(f"     Queries: {queries}")
  
         all_findings = []
@@ -271,12 +283,9 @@ class Researcher:
             f"{title}:\n{text}" for title, text, _ in all_findings
         )
  
-        node_count_before = len(self.brain.graph.nodes)
-        self.ingestor.ingest(combined_text, source=EdgeSource.RESEARCH)
-        node_count_after  = len(self.brain.graph.nodes)
- 
-        new_ids = list(self.brain.graph.nodes)[-
-            (node_count_after - node_count_before):]
+        new_ids = self.ingestor.ingest(
+            combined_text, source=EdgeSource.RESEARCH
+        ) or []
         entry.node_ids = new_ids
  
         # check if question was resolved by these findings
@@ -286,7 +295,7 @@ class Researcher:
         raw = self._llm(RESOLUTION_CHECK_PROMPT.format(
             question=question_text,
             findings=findings_summary
-        ))
+        ), temperature=0.2)
         try:
             result = json.loads(raw)
             entry.resolved = result.get('grade', 'none')
@@ -339,14 +348,13 @@ class Researcher:
         for item in questions:
             if item.resolved:
                 continue
-            entry = self._research_question(item.text)
+            entry = self._research_question(item.text, node_id=item.node_id)
             self.log.entries.append(entry)
             # small pause between questions
             time.sleep(1)
  
         # save log
-        with open(log_path, 'w') as f:
-            json.dump(self.log.to_dict(), f, indent=2)
+        atomic_write_json(log_path, self.log.to_dict())
  
         resolved = sum(1 for e in self.log.entries
                        if e.resolved in ['partial', 'strong'])

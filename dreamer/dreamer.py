@@ -1,13 +1,15 @@
 import random
 import time
 import json
+import re
 import numpy as np
 from enum import Enum
 from dataclasses import dataclass, field
-from sentence_transformers import SentenceTransformer
 from ollama import Client
 from graph.brain import (Brain, Edge, EdgeType, EdgeSource,
                          NodeStatus, NodeType, BrainMode, ANALOGY_WEIGHTS)
+from config import THRESHOLDS
+from embedding import embed as shared_embed
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -16,8 +18,6 @@ DEFAULT_STEPS       = 20
 DEFAULT_TEMP        = 0.7
 DEPTH_STEPS         = 3
 VISITED_PENALTY     = 0.25
-QUESTION_DEDUP_HIGH = 0.90
-QUESTION_DEDUP_LOW  = 0.70
 
 # mode modifiers
 MODE_TEMP_BOOST = {
@@ -253,17 +253,22 @@ class Dreamer:
         self.brain           = brain
         self.llm             = Client()
         self.research_agenda = research_agenda
-        self.embedder        = SentenceTransformer('all-MiniLM-L6-v2')
+        self._embedding_cache = {}
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.7) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
     def _embed(self, text: str) -> np.ndarray:
-        return self.embedder.encode(text, normalize_embeddings=True)
+        if text in self._embedding_cache:
+            return self._embedding_cache[text]
+        emb = shared_embed(text)
+        self._embedding_cache[text] = emb
+        return emb
 
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(np.dot(a, b))
@@ -313,10 +318,13 @@ class Dreamer:
         new_emb = self._embed(new_q)
         for eq, emb in zip(existing, embeddings):
             sim = self._cosine(new_emb, emb)
-            if sim > QUESTION_DEDUP_HIGH:
+            if sim > THRESHOLDS.QUESTION_DEDUP_HIGH:
                 return True
-            if sim > QUESTION_DEDUP_LOW:
-                raw = self._llm(QUESTION_SIMILAR_PROMPT.format(q1=new_q, q2=eq))
+            if sim > THRESHOLDS.QUESTION_DEDUP_LOW:
+                raw = self._llm(
+                    QUESTION_SIMILAR_PROMPT.format(q1=new_q, q2=eq),
+                    temperature=0.1
+                )
                 if raw.lower().startswith('yes'):
                     return True
         return False
@@ -370,7 +378,13 @@ class Dreamer:
         else:
             prompt = START_NODE_WANDERING.format(nodes=node_list)
 
-        chosen = self._llm(prompt).strip()
+        chosen = self._llm(prompt, temperature=0.2).strip()
+        uuid_tokens = re.findall(
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+            chosen.lower()
+        )
+        if uuid_tokens and uuid_tokens[0] in dict(nodes):
+            return uuid_tokens[0]
         if chosen in dict(nodes):
             return chosen
 
@@ -440,9 +454,14 @@ class Dreamer:
         if not self.research_agenda or self.brain.is_wandering():
             return "none", "", ""
         open_items = self.research_agenda.get_prioritized_questions(15)
+        node_emb = self._embed(node_data['statement'])
         for item in open_items:
+            item_emb = self._embed(item.text)
+            if self._cosine(node_emb, item_emb) < THRESHOLDS.AGENDA_PREFILTER:
+                continue
             raw = self._llm(ANSWER_CHECK_PROMPT.format(
-                current_node=node_data['statement'], question=item.text))
+                current_node=node_data['statement'], question=item.text
+            ), temperature=0.1)
             try:
                 result = json.loads(raw)
                 match  = result.get('match', 'none')
@@ -464,7 +483,7 @@ class Dreamer:
         raw = self._llm(MISSION_ADVANCE_PROMPT.format(
             mission=mission['question'],
             node=node_data['statement'],
-            narration=narration))
+            narration=narration), temperature=0.4)
         try:
             result = json.loads(raw)
             if result.get('advances') and result.get('strength', 0) > 0.5:
@@ -505,7 +524,7 @@ class Dreamer:
             mission_line=mission_line,
             node=node_data['statement'],
             question=question,
-            explanation=explanation))
+            explanation=explanation), temperature=0.85)
         lines  = raw.strip().split('\n')
         q_line = next((l for l in lines if l.startswith('Q:')), "")
         followup = q_line[2:].strip() if q_line else ""
@@ -522,7 +541,7 @@ class Dreamer:
             edge_narration = edge.get('narration', '') if edge else ''
             raw = self._llm(self._narration_prompt(
                 current_data['statement'], edge_type,
-                edge_narration, next_data['statement']))
+                edge_narration, next_data['statement']), temperature=0.85)
             narration, _, is_insight, depth = self._parse_narration(raw)
             ds = DreamStep(
                 step=step_offset+d, from_id=current_id, to_id=next_id,
@@ -596,7 +615,7 @@ class Dreamer:
 
             raw = self._llm(self._narration_prompt(
                 current['statement'], edge_type,
-                edge_narration, next_node['statement']))
+                edge_narration, next_node['statement']), temperature=0.85)
             narration, question, is_insight, insight_depth = \
                 self._parse_narration(raw)
 
@@ -665,7 +684,7 @@ class Dreamer:
 
             if match_grade != 'none':
                 log.answers.append({
-                    "step": step, "node": next_node['statement'],
+                    "step": step, "node": next_id,
                     "question": matched_q, "grade": match_grade,
                     "explanation": match_explanation
                 })
@@ -679,7 +698,7 @@ class Dreamer:
                     next_id, f"Dream insight: {mission_explanation}",
                     strength=mission_strength)
                 log.mission_advances.append({
-                    "step": step, "node": next_node['statement'],
+                    "step": step, "node": next_id,
                     "explanation": mission_explanation,
                     "strength": mission_strength
                 })
@@ -726,7 +745,10 @@ class Dreamer:
         answer_text  = "\n".join(f"- [{a['grade']}] {a['explanation']}" for a in log.answers) or "none"
         mission_text = "\n".join(f"- ({m['strength']:.2f}) {m['explanation']}" for m in log.mission_advances) or "none"
 
-        log.summary = self._llm(self._summary_prompt(step_text, answer_text, mission_text))
+        log.summary = self._llm(
+            self._summary_prompt(step_text, answer_text, mission_text),
+            temperature=0.7
+        )
 
         import os
         os.makedirs("logs", exist_ok=True)

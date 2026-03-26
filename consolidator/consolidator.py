@@ -1,21 +1,24 @@
 import json
 import time
+import os
 import numpy as np
 from dataclasses import dataclass, field
-from sentence_transformers import SentenceTransformer
 from ollama import Client
 from graph.brain import (Brain, Node, Edge, EdgeType, EdgeSource,
                          NodeStatus, NodeType)
+from config import THRESHOLDS
+from embedding import embed as shared_embed
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OLLAMA_MODEL          = "llama3.1:8b"
-DUPLICATE_THRESHOLD   = 0.88   # cosine above this = merge nodes
+DUPLICATE_THRESHOLD   = THRESHOLDS.DUPLICATE_MERGE
 SYNTHESIS_SAMPLE      = 6      # how many recent nodes to check for synthesis
 ABSTRACTION_MIN_NODES = 3      # min cluster size to attempt abstraction
-GAP_CONFIDENCE        = 0.75   # min edge confidence to infer a gap between nodes
+GAP_CONFIDENCE        = THRESHOLDS.GAP_CONFIDENCE
 MAX_GAP_PER_RUN       = 10     # max gaps to infer in one consolidation run
-GAP_DEDUP_THRESHOLD   = 0.75   # if inferred gap is too similar to existing node, skip it
+GAP_DEDUP_THRESHOLD   = THRESHOLDS.GAP_DEDUP
+LAST_CONSOLIDATION_PATH = "data/last_consolidation.txt"
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -146,20 +149,20 @@ class Consolidator:
         self.brain    = brain
         self.observer = observer
         self.llm      = Client()
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
         self._embedding_cache: dict = {}
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.6) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
     def _embed(self, text: str) -> np.ndarray:
         if text in self._embedding_cache:
             return self._embedding_cache[text]
-        emb = self.embedder.encode(text, normalize_embeddings=True)
+        emb = shared_embed(text)
         self._embedding_cache[text] = emb
         return emb
 
@@ -209,7 +212,7 @@ class Consolidator:
                 unified = self._llm(MERGE_NARRATION_PROMPT.format(
                     node_a=node_i['statement'],
                     node_b=node_j['statement']
-                ))
+                ), temperature=0.4)
                 self.brain.update_node(node_ids[i], statement=unified)
 
                 # inherit edges from j — redirect to i
@@ -282,7 +285,7 @@ class Consolidator:
 
         raw = self._llm(SYNTHESIS_PROMPT.format(
             nodes="\n\n".join(node_lines)
-        ))
+        ), temperature=0.6)
         try:
             result = json.loads(raw)
             if result.get('synthesis'):
@@ -344,8 +347,12 @@ class Consolidator:
             if len(members) < ABSTRACTION_MIN_NODES:
                 continue
 
-            # sample up to 5 members
-            sample = members[:5]
+            # sample top-importance members
+            sample = sorted(
+                members,
+                key=lambda x: x[1].get('importance', 0.5),
+                reverse=True
+            )[:5]
             node_lines = [
                 f"{data['statement']}" for _, data in sample
             ]
@@ -353,7 +360,7 @@ class Consolidator:
             raw = self._llm(ABSTRACTION_PROMPT.format(
                 nodes   = "\n\n".join(node_lines),
                 cluster = cluster
-            ))
+            ), temperature=0.6)
             try:
                 result = json.loads(raw)
                 if result.get('abstraction'):
@@ -407,6 +414,9 @@ class Consolidator:
         """
         print("  [4/6] Gap detection...")
         checked = set()
+        cluster_count = len(set(
+            d.get('cluster', '?') for _, d in self.brain.all_nodes()
+        ))
 
         # snapshot edges before loop — gap detection adds new nodes/edges
         edges_snapshot = list(self.brain.graph.edges(data=True))
@@ -428,15 +438,16 @@ class Consolidator:
             if not node_u or not node_v:
                 continue
             
-            # only cross-cluster gaps are interesting
-            if node_u.get('cluster') == node_v.get('cluster'):
+            # once cluster diversity is high, prioritize cross-cluster gaps
+            if (cluster_count > 3 and
+                    node_u.get('cluster') == node_v.get('cluster')):
                 continue
 
             raw = self._llm(GAP_PROMPT.format(
                 node_a        = node_u['statement'],
                 node_b        = node_v['statement'],
                 edge_narration= data.get('narration', '')
-            ))
+            ), temperature=0.6)
             try:
                 result = json.loads(raw)
                 if result.get('gap'):
@@ -537,7 +548,16 @@ class Consolidator:
         """
         print("  [6/6] Edge decay...")
         before = len(self.brain.graph.edges)
-        self.brain.apply_decay()
+        try:
+            with open(LAST_CONSOLIDATION_PATH, "r") as f:
+                last = float(f.read().strip())
+            elapsed_days = max(0.0, (time.time() - last) / 86400)
+        except FileNotFoundError:
+            elapsed_days = 1.0
+        self.brain.apply_decay(elapsed_days=elapsed_days)
+        os.makedirs("data", exist_ok=True)
+        with open(LAST_CONSOLIDATION_PATH, "w") as f:
+            f.write(str(time.time()))
 
         # prune edges that have decayed to near zero
         to_remove = [
@@ -550,6 +570,40 @@ class Consolidator:
 
         report.edges_decayed = before - len(self.brain.graph.edges)
         print(f"    Done — {report.edges_decayed} edges pruned")
+
+    def _recompute_mission_relevance(self):
+        mission = self.brain.get_mission()
+        if not mission:
+            return
+        candidates = [
+            (nid, data) for nid, data in self.brain.all_nodes()
+            if data.get('importance', 0) > 0.6
+            and data.get('node_type') != NodeType.MISSION.value
+        ][:20]
+        for nid, data in candidates:
+            prompt = (
+                f'Central research question: "{mission["question"]}"\n\n'
+                f'New idea being added to the knowledge graph:\n{data["statement"]}\n\n'
+                "Does this new idea meaningfully advance, inform, or relate to the central question?\n\n"
+                "Respond with a JSON object:\n"
+                "{\n"
+                '  "relevant": true or false,\n'
+                '  "strength": a float 0.0 to 1.0 indicating how strongly it relates,\n'
+                '  "narration": "one sentence explaining the connection, or \'not relevant\'"\n'
+                "}\n\n"
+                "Respond ONLY with JSON."
+            )
+            raw = self._llm(prompt, temperature=0.1)
+            try:
+                result = json.loads(raw)
+                if result.get("relevant") and result.get("strength", 0) > 0.4:
+                    self.brain.link_to_mission(
+                        nid,
+                        result.get("narration", ""),
+                        strength=result.get("strength", 0.5)
+                    )
+            except (json.JSONDecodeError, ValueError):
+                continue
 
     # ── Main consolidation run ────────────────────────────────────────────────
 
@@ -576,6 +630,7 @@ class Consolidator:
         self._gap_detection(report)
         self._contradiction_update(report)
         self._apply_decay(report)
+        self._recompute_mission_relevance()
 
         # generate summary
         report.summary = self._llm(CONSOLIDATION_SUMMARY_PROMPT.format(
@@ -586,7 +641,7 @@ class Consolidator:
             gaps          = report.gaps,
             contradictions= report.contradictions_updated,
             decayed       = report.edges_decayed
-        ))
+        ), temperature=0.7)
 
         # save report
         import os

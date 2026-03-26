@@ -1,5 +1,6 @@
 import time
 import json
+import os
 import signal
 import sys
 from datetime import datetime
@@ -15,6 +16,7 @@ from consolidator.consolidator import Consolidator
 from researcher.researcher import Researcher
 from reader.reader import Reader
 from notebook.notebook import Notebook
+from sandbox.sandbox import Sandbox
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -34,6 +36,7 @@ REGEN_LIST_THRESHOLD = 3   # regenerate reading list when fewer than this unread
 
 BRAIN_PATH    = "data/brain.json"
 OBSERVER_PATH = "data/observer.json"
+DAILY_LEDGER_PATH = "data/daily_new_nodes.json"
 
 # ── Cycle log ─────────────────────────────────────────────────────────────────
 
@@ -93,6 +96,7 @@ class DreamerScheduler:
         self.notebook    = Notebook(self.brain, observer=self.observer)
         self.reader      = Reader(self.brain, observer=self.observer,
                                   notebook=self.notebook)
+        self.sandbox     = Sandbox(self.brain, observer=self.observer)
 
         signal.signal(signal.SIGINT,  self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -119,6 +123,25 @@ class DreamerScheduler:
 
     # ── Phase runners ─────────────────────────────────────────────────────────
 
+    def _last_phase_interrupted(self, phase: str) -> bool:
+        for entry in reversed(self.cycle_log.entries):
+            if entry.get("phase") == phase:
+                return entry.get("interrupted", False)
+        return False
+
+    def _append_daily_nodes(self, node_ids: list[str]):
+        if not node_ids:
+            return
+        os.makedirs("data", exist_ok=True)
+        try:
+            with open(DAILY_LEDGER_PATH, "r") as f:
+                existing = json.load(f)
+        except FileNotFoundError:
+            existing = []
+        merged = list(dict.fromkeys(existing + node_ids))
+        with open(DAILY_LEDGER_PATH, "w") as f:
+            json.dump(merged, f)
+
     def run_dream_phase(self):
         cycle      = self.cycle_log.current_cycle() + 1
         brain_mode = self.brain.get_mode()
@@ -134,6 +157,11 @@ class DreamerScheduler:
                 log_path=f"logs/dream_cycle{cycle}_wandering.json")
             self.observer.observe(log1)
             self.notebook.write_morning_entry(log1, cycle)
+            for signal in self.observer.emergence_feed[-5:]:
+                if (signal.type == "mission_advance" and
+                        signal.cycle == self.observer.cycle_count):
+                    self.notebook.write_breakthrough(signal.signal, cycle)
+                    break
 
             # pressure dream only in focused/transitional
             if not self.brain.is_wandering():
@@ -141,7 +169,7 @@ class DreamerScheduler:
                     mode=DreamMode.PRESSURE, steps=DREAM_STEPS//2,
                     temperature=DREAM_TEMPERATURE-0.1, run_nrem=False,
                     log_path=f"logs/dream_cycle{cycle}_pressure.json")
-                self.observer.observe(log2)
+                self.observer.observe_supplemental(log2)
 
             entry.summary = log1.summary
         except Exception as e:
@@ -154,6 +182,9 @@ class DreamerScheduler:
 
     def run_research_phase(self):
         """Research + reading in the day cycle."""
+        if self._last_phase_interrupted("dream"):
+            print("Skipping research — previous dream cycle was interrupted.")
+            return
         cycle      = self.cycle_log.current_cycle()
         brain_mode = self.brain.get_mode()
         entry      = CycleEntry(cycle=cycle, phase="research", brain_mode=brain_mode)
@@ -167,6 +198,8 @@ class DreamerScheduler:
                     max_questions=RESEARCH_QUESTIONS,
                     log_path=f"logs/research_cycle{cycle}.json")
                 self.notebook.write_field_notes(log, cycle)
+                all_new = [nid for r in log.entries for nid in r.node_ids]
+                self._append_daily_nodes(all_new)
             else:
                 print("Wandering mode — skipping targeted research")
         except Exception as e:
@@ -194,6 +227,11 @@ class DreamerScheduler:
 
             results = self.reader.reading_day(max_items=READING_ITEMS)
             absorbed = sum(1 for r in results if r.success)
+            reading_new = [
+                nid for result in results if result.success
+                for nid in getattr(result, "node_ids", [])
+            ]
+            self._append_daily_nodes(reading_new)
             print(f"Reading day: {absorbed}/{len(results)} absorbed")
             entry.summary = f"Absorbed {absorbed} texts."
         except Exception as e:
@@ -205,6 +243,8 @@ class DreamerScheduler:
             self._save_state()
 
     def run_consolidation_phase(self):
+        if self._last_phase_interrupted("research"):
+            print("Warning: previous research was interrupted — consolidating anyway.")
         cycle      = self.cycle_log.current_cycle()
         brain_mode = self.brain.get_mode()
         entry      = CycleEntry(cycle=cycle, phase="consolidation", brain_mode=brain_mode)
@@ -212,8 +252,19 @@ class DreamerScheduler:
         print(f"DREAMER — Consolidation {cycle} [{brain_mode.upper()}]")
         print(f"{'='*60}")
         try:
+            try:
+                with open(DAILY_LEDGER_PATH, "r") as f:
+                    new_node_ids = json.load(f)
+                os.remove(DAILY_LEDGER_PATH)
+            except FileNotFoundError:
+                new_node_ids = []
             report = self.consolidator.consolidate(
+                new_node_ids=new_node_ids,
                 save_path=f"logs/consolidation_cycle{cycle}.json")
+            try:
+                self.sandbox.scan_and_test(max_tests=2)
+            except Exception as e:
+                print(f"Sandbox error: {e}")
             self.notebook.write_evening_entry(report, cycle)
             self.notebook.update_running_hypothesis(cycle)
             entry.summary = report.summary

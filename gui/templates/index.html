@@ -1370,6 +1370,17 @@ function handleEvent(ev) {
   } else if(t==='mission_set') {
     addEvent('ev-seed','🎯',`<span class="evtype ev-seed">Mission</span>`,'',d.question||d.message||'');
     loadMission();
+  } else if(t==='absorption_complete') {
+    addEvent('ev-dream_step','📖',`<span class="evtype">Absorbed</span>`,
+      d.title || '', `${d.node_count||0} nodes added. ${d.summary||''}`);
+  } else if(t==='reading_complete') {
+    setStatus(`Reading complete — ${d.absorbed||0} absorbed.`);
+  } else if(t==='reading_list_updated') {
+    setStatus(`Reading list updated — ${d.added||0} new items added.`);
+  } else if(t==='seed_planted') {
+    addEvent('ev-seed','🌱',`<span class="evtype ev-seed">Seeded</span>`,'',d.concept||'');
+  } else if(t==='mode_change') {
+    setStatus(d.message||'Mode changed.');
   } else if(t==='error') {
     addEvent('ev-error','✕',`<span class="evtype ev-error">Error</span>`,'',d.message||'');
   }

@@ -2,21 +2,24 @@ import json
 import time
 import numpy as np
 from dataclasses import dataclass, field
-from sentence_transformers import SentenceTransformer
 from ollama import Client
 from graph.brain import Brain, EdgeType, NodeType
 from dreamer.dreamer import DreamLog, DreamStep
+from config import THRESHOLDS
+from embedding import embed as shared_embed
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OLLAMA_MODEL               = "llama3.1:8b"
 WEAK_EDGE_REPEAT_THRESHOLD = 3
 QUESTION_REPEAT_THRESHOLD  = 2
-COHERENCE_THRESHOLD        = 0.65
+COHERENCE_THRESHOLD        = THRESHOLDS.COHERENCE
 INCUBATION_EMERGENCE_AGE   = 5
-SIMILARITY_HIGH            = 0.90
-SIMILARITY_MID             = 0.70
+SIMILARITY_HIGH            = THRESHOLDS.QUESTION_DEDUP_HIGH
+SIMILARITY_MID             = THRESHOLDS.QUESTION_DEDUP_LOW
 MAX_EMERGENCES_PER_TYPE    = 2
+EMERGENCE_COOLDOWN_HOURS   = 24
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -121,7 +124,6 @@ class Observer:
     def __init__(self, brain: Brain):
         self.brain                 = brain
         self.llm                   = Client()
-        self.embedder              = SentenceTransformer('all-MiniLM-L6-v2')
         self.agenda: list[AgendaItem]          = []
         self.agenda_embeddings: list           = []
         self.emergence_feed: list[EmergenceSignal] = []
@@ -129,16 +131,18 @@ class Observer:
         self.edge_traversal_counts: dict       = {}
         self.cycle_count                       = 0
         self._cycle_emergence_counts: dict     = {}
+        self._emergence_last_fired: dict       = {}
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.5) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
     def _embed(self, text: str) -> np.ndarray:
-        return self.embedder.encode(text, normalize_embeddings=True)
+        return shared_embed(text)
 
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(np.dot(a, b))
@@ -156,7 +160,7 @@ class Observer:
             return True
         if sim < SIMILARITY_MID:
             return False
-        raw = self._llm(QUESTION_SIMILAR_PROMPT.format(q1=q1, q2=q2))
+        raw = self._llm(QUESTION_SIMILAR_PROMPT.format(q1=q1, q2=q2), temperature=0.1)
         return raw.lower().startswith('yes')
 
     # ── Agenda ────────────────────────────────────────────────────────────────
@@ -218,7 +222,7 @@ class Observer:
                             hypothesis  = item.text,
                             candidate   = node['statement'],
                             explanation = explanation
-                        ))
+                        ), temperature=0.1)
                         if adv.lower().startswith('yes'):
                             self._flag_emergence(
                                 type     = "hypothesis_advanced",
@@ -271,13 +275,18 @@ class Observer:
         insights = []
         try:
             import os
-            for fname in sorted(os.listdir("logs"), reverse=True)[:5]:
-                if fname.startswith("dream_") and fname.endswith(".json"):
-                    with open(f"logs/{fname}") as f:
-                        d = json.load(f)
-                    for ins in d.get("insights", []):
-                        if ins.get("depth") in ["structural", "isomorphism"]:
-                            insights.append(ins.get("narration", ""))
+            dream_files = [
+                fname for fname in sorted(os.listdir("logs"), reverse=True)
+                if fname.startswith("dream_cycle") and fname.endswith(".json")
+            ]
+            if not dream_files:
+                print("Observer: no dream_cycle*.json files found for mission summary.")
+            for fname in dream_files[:5]:
+                with open(f"logs/{fname}") as f:
+                    d = json.load(f)
+                for ins in d.get("insights", []):
+                    if ins.get("depth") in ["structural", "isomorphism"]:
+                        insights.append(ins.get("narration", ""))
         except Exception:
             pass
 
@@ -300,7 +309,7 @@ class Observer:
                 for a in top_advances) or "none yet",
             insights      = "\n".join(f"- {i}" for i in insights) or "none yet",
             contradictions= "\n".join(f"- {c}" for c in contradictions) or "none"
-        ))
+        ), temperature=0.4)
 
     # ── Incubation ────────────────────────────────────────────────────────────
 
@@ -383,7 +392,7 @@ class Observer:
                     node_b   = nt['statement'],
                     narration= step.narration,
                     depth    = step.insight_depth
-                )))
+                ), temperature=0.2))
             except ValueError:
                 continue
             if score >= COHERENCE_THRESHOLD:
@@ -400,28 +409,33 @@ class Observer:
 
     def _flag_emergence(self, type: str, detail: str,
                         cycle: int, node_ids: list = None):
+        last_fired = self._emergence_last_fired.get(type, 0)
+        if time.time() - last_fired < EMERGENCE_COOLDOWN_HOURS * 3600:
+            return
         count = self._cycle_emergence_counts.get(type, 0)
         if count >= MAX_EMERGENCES_PER_TYPE:
             return
         signal_text = self._llm(EMERGENCE_PROMPT.format(
             mission=self._mission_text(),
             type=type, detail=detail
-        ))
+        ), temperature=0.5)
         signal = EmergenceSignal(
             signal=signal_text, type=type,
             cycle=cycle, node_ids=node_ids or []
         )
         self.emergence_feed.append(signal)
         self._cycle_emergence_counts[type] = count + 1
+        self._emergence_last_fired[type] = time.time()
         print(f"\n  ◆ EMERGENCE [{type}]: {signal_text}")
 
     # ── Main observe ──────────────────────────────────────────────────────────
 
-    def observe(self, log: DreamLog):
-        self.cycle_count += 1
+    def _observe_internal(self, log: DreamLog, *, increment_cycle: bool,
+                          increment_incubation: bool):
+        if increment_cycle:
+            self.cycle_count += 1
+            self._cycle_emergence_counts = {}
         cycle = self.cycle_count
-        self._cycle_emergence_counts = {}
-
         print(f"\n── Observer cycle {cycle} ──")
 
         # ingest questions
@@ -446,7 +460,8 @@ class Observer:
         self._track_edge_traversals(log.steps, cycle)
         self._check_contradictions(cycle)
         self._check_cross_cluster_insights(log.steps, cycle)
-        self.increment_incubation()
+        if increment_incubation:
+            self.increment_incubation()
 
         resolved = sum(1 for i in self.agenda if i.resolved)
         print(f"   Agenda: {len(self.agenda)} ({resolved} resolved)")
@@ -455,6 +470,16 @@ class Observer:
               f"{sum(self._cycle_emergence_counts.values())} "
               f"total: {len(self.emergence_feed)}")
         print(f"── Observer done ──\n")
+
+    def observe(self, log: DreamLog):
+        self._observe_internal(
+            log, increment_cycle=True, increment_incubation=True
+        )
+
+    def observe_supplemental(self, log: DreamLog):
+        self._observe_internal(
+            log, increment_cycle=False, increment_incubation=False
+        )
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -472,8 +497,8 @@ class Observer:
                 for k, v in self.edge_traversal_counts.items()
             }
         }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        data["emergence_last_fired"] = self._emergence_last_fired
+        atomic_write_json(path, data)
         print(f"Observer saved — {len(self.agenda)} items, "
               f"{len(self.emergence_feed)} emergences, "
               f"{len(self.mission_advances)} mission advances")
@@ -498,6 +523,7 @@ class Observer:
                 tuple(k.split('|')): v
                 for k, v in data.get('edge_traversal_counts', {}).items()
             }
+            self._emergence_last_fired = data.get("emergence_last_fired", {})
             print(f"Observer loaded — {len(self.agenda)} items, "
                   f"{len(self.emergence_feed)} emergences, "
                   f"{len(self.mission_advances)} mission advances")

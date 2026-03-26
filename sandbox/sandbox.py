@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass, field
 from ollama import Client
 from graph.brain import Brain, Node, Edge, EdgeType, EdgeSource, NodeType, NodeStatus
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -118,10 +119,11 @@ class Sandbox:
         self.results: list[SandboxResult] = []
         self._load()
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.5) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
@@ -132,7 +134,7 @@ class Sandbox:
     # ── Testability check ─────────────────────────────────────────────────────
 
     def is_testable(self, hypothesis: str) -> tuple:
-        raw = self._llm(TESTABILITY_PROMPT.format(hypothesis=hypothesis))
+        raw = self._llm(TESTABILITY_PROMPT.format(hypothesis=hypothesis), temperature=0.2)
         try:
             result = json.loads(raw)
             return (
@@ -211,7 +213,7 @@ class Sandbox:
             hypothesis = hypothesis,
             approach   = approach,
             mission    = self._mission()
-        ))
+        ), temperature=0.2)
 
         # strip markdown fences
         if '```' in code:
@@ -237,7 +239,7 @@ class Sandbox:
             code       = code,
             output     = stdout or "no output",
             errors     = stderr or "none"
-        ))
+        ), temperature=0.2)
         try:
             interp = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
@@ -396,8 +398,7 @@ class Sandbox:
     def _save(self):
         os.makedirs("logs", exist_ok=True)
         data = {"results": [r.to_dict() for r in self.results]}
-        with open(SANDBOX_LOG_PATH, 'w') as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(SANDBOX_LOG_PATH, data)
 
     def _load(self):
         try:

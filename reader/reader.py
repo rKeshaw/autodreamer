@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from ollama import Client
 from graph.brain import Brain, EdgeSource
 from ingestion.ingestor import Ingestor
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -95,6 +96,7 @@ class ReadingEntry:
     status:      str   = "unread"   # unread | reading | read | failed
     added_by:    str   = "user"     # user | system | dream | auto
     added_reason:str   = ""
+    raw_text:    str   = ""
     absorbed_at: float = 0.0
     node_count:  int   = 0          # nodes added when absorbed
 
@@ -109,6 +111,7 @@ class AbsorptionResult:
     title:       str
     text_length: int
     node_count:  int
+    node_ids:    list
     summary:     str
     success:     bool
     error:       str  = ""
@@ -121,14 +124,15 @@ class Reader:
         self.observer = observer
         self.notebook = notebook
         self.llm      = Client()
-        self.ingestor = Ingestor(brain)   # absorption mode — no agenda
+        self.ingestor = Ingestor(brain, research_agenda=observer)
         self.reading_list: list[ReadingEntry] = []
         self._load_list()
 
-    def _llm(self, prompt: str) -> str:
+    def _llm(self, prompt: str, temperature: float = 0.6) -> str:
         response = self.llm.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": temperature}
         )
         return response['message']['content'].strip()
 
@@ -138,6 +142,9 @@ class Reader:
         try:
             with open(READING_LIST_PATH, 'r') as f:
                 data = json.load(f)
+            for entry in data:
+                if entry.get("source_type") == "text" and not entry.get("raw_text"):
+                    entry["raw_text"] = entry.get("added_reason", "")
             self.reading_list = [ReadingEntry(**e) for e in data]
             print(f"Reading list loaded — {len(self.reading_list)} entries "
                   f"({sum(1 for e in self.reading_list if e.status=='unread')} unread)")
@@ -145,10 +152,10 @@ class Reader:
             self.reading_list = []
 
     def _save_list(self):
-        os.makedirs(os.path.dirname(READING_LIST_PATH)
-                    if os.path.dirname(READING_LIST_PATH) else ".", exist_ok=True)
-        with open(READING_LIST_PATH, 'w') as f:
-            json.dump([e.to_dict() for e in self.reading_list], f, indent=2)
+        atomic_write_json(
+            READING_LIST_PATH,
+            [e.to_dict() for e in self.reading_list]
+        )
 
     def add_to_list(self, url: str, title: str = "", source_type: str = "web",
                     priority: float = 0.5, added_by: str = "user",
@@ -175,8 +182,7 @@ class Reader:
             url=f"text://{uuid.uuid4()}", title=title,
             source_type="text", priority=priority, added_by="user"
         )
-        # store text inline in title field for now
-        entry.added_reason = text
+        entry.raw_text = text
         self.reading_list.append(entry)
         self._save_list()
         # absorb immediately
@@ -275,25 +281,24 @@ class Reader:
             self._save_list()
             return AbsorptionResult(
                 entry=entry, title=entry.title, text_length=len(text),
-                node_count=0, summary="Text too short to absorb.",
+                node_count=0, node_ids=[], summary="Text too short to absorb.",
                 success=False, error="Text too short"
             )
 
         nodes_before = len(self.brain.graph.nodes)
 
         # absorb with READING source — no agenda checking
-        self.ingestor.ingest(text, source=EdgeSource.READING)
+        created_node_ids = self.ingestor.ingest(text, source=EdgeSource.READING) or []
 
         nodes_after  = len(self.brain.graph.nodes)
-        node_count   = nodes_after - nodes_before
+        node_count   = len(created_node_ids)
         entry.node_count  = node_count
         entry.status      = 'read'
         entry.absorbed_at = time.time()
         self._save_list()
 
         # get summaries of new nodes for the reading log
-        all_nodes  = self.brain.all_nodes()
-        new_node_ids = [nid for nid, _ in all_nodes[-node_count:]] if node_count > 0 else []
+        new_node_ids = created_node_ids
         node_summaries = "\n".join(
             f"- {self.brain.get_node(nid)['statement']}"
             for nid in new_node_ids[:8]
@@ -320,7 +325,7 @@ class Reader:
         print(f"  Absorbed: {entry.title} — {node_count} new nodes")
         return AbsorptionResult(
             entry=entry, title=entry.title,
-            text_length=len(text), node_count=node_count,
+            text_length=len(text), node_count=node_count, node_ids=new_node_ids,
             summary=summary, success=True
         )
 
@@ -334,8 +339,7 @@ class Reader:
         title = entry.title
 
         if entry.source_type == "text":
-            # text was stored in added_reason
-            text = entry.added_reason
+            text = entry.raw_text or entry.added_reason
         elif entry.source_type == "wikipedia":
             title, text = self._fetch_wikipedia(entry.url)
         elif entry.source_type == "arxiv":
@@ -351,7 +355,7 @@ class Reader:
             self._save_list()
             return AbsorptionResult(
                 entry=entry, title=title, text_length=0,
-                node_count=0, summary="", success=False,
+                node_count=0, node_ids=[], summary="", success=False,
                 error=text or "Empty response"
             )
 

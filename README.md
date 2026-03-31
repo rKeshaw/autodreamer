@@ -80,34 +80,34 @@ The system will now run on a daily cycle automatically.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                        AutoScientist                               │
+│                        AutoScientist                             │
 │                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
-│  │ Reader   │→ │ Ingestor │→ │  Brain   │← │ Insight Buffer   │ │
-│  │(Wikipedia│  │(extract  │  │(NetworkX │  │(near-miss pairs  │ │
-│  │ arXiv)   │  │ nodes &  │  │ graph +  │  │ re-evaluated     │ │
-│  └──────────┘  │ edges)   │  │ FAISS)   │  │ each cycle)      │ │
-│                └──────────┘  └────┬─────┘  └──────────────────┘ │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
+│  │ Reader   │→ │ Ingestor │→ │  Brain   │← │ Insight Buffer   │  │
+│  │(Wikipedia│  │(extract  │  │(NetworkX │  │(near-miss pairs  │  │
+│  │ arXiv)   │  │ nodes &  │  │ graph +  │  │ re-evaluated     │  │
+│  └──────────┘  │ edges)   │  │ FAISS)   │  │ each cycle)      │  │
+│                └──────────┘  └────┬─────┘  └──────────────────┘  │
 │                                   │                              │
 │       ┌───────────────────────────┼───────────────────────┐      │
 │       │                           │                       │      │
-│  ┌────▼─────┐  ┌──────────┐  ┌───▼──────┐  ┌──────────┐ │      │
-│  │ Dreamer  │  │ Thinker  │  │Consolida-│  │ Sandbox  │ │      │
-│  │(night    │  │(5 reason-│  │tor (merge│  │(run code │ │      │
-│  │ walks)   │  │ patterns)│  │ & decay) │  │ tests)   │ │      │
-│  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘ │      │
+│  ┌────▼─────┐  ┌──────────┐  ┌────▼─────┐  ┌──────────┐   │      │
+│  │ Dreamer  │  │ Thinker  │  │Consolida-│  │ Sandbox  │   │      │
+│  │(night    │  │(5 reason-│  │tor (merge│  │(run code │   │      │
+│  │ walks)   │  │ patterns)│  │ & decay) │  │ tests)   │   │      │
+│  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘   │      │
 │       │                                                   │      │
-│  ┌────▼─────┐  ┌──────────┐  ┌──────────┐               │      │
-│  │ Observer │  │ Notebook │  │Researcher│               │      │
-│  │(track    │  │(journal) │  │(search & │               │      │
-│  │ progress)│  └──────────┘  │ verify)  │               │      │
-│  └──────────┘                └──────────┘               │      │
+│  ┌────▼─────┐  ┌──────────┐  ┌──────────┐                 │      │
+│  │ Observer │  │ Notebook │  │Researcher│                 │      │
+│  │(track    │  │(journal) │  │(search & │                 │      │
+│  │ progress)│  └──────────┘  │ verify)  │                 │      │
+│  └──────────┘                └──────────┘                 │      │
 │       └───────────────────────────────────────────────────┘      │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │                    Scheduler (cron)                       │    │
-│  │  09:00 Research → 11:00 Think → 14:00 Read → 16:00 Write│    │
-│  │  20:00 Consolidate → 23:00 Dream                        │    │
+│  │                    Scheduler (cron)                      │    │
+│  │  09:00 Research → 11:00 Think → 14:00 Read → 16:00 Write │    │
+│  │  20:00 Consolidate → 23:00 Dream                         │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
@@ -298,6 +298,7 @@ autoscientist/
 │   └── thinker.py         # Structured reasoning (5 patterns)
 │
 ├── requirements.txt
+├── README.md
 └── LICENSE                # GPL-3.0
 ```
 

@@ -417,6 +417,10 @@ class Ingestor:
 
         # process concepts
         for stmt in statements:
+            if isinstance(stmt, dict):
+                stmt = stmt.get('statement', '') or stmt.get('concept', '') or stmt.get('text', '') or str(stmt)
+            if not isinstance(stmt, str) or not stmt.strip():
+                continue
             nid = self._process_statement(
                 stmt, existing_embeddings, source, NodeType.CONCEPT
             )
@@ -428,8 +432,13 @@ class Ingestor:
 
         # process hypotheses
         for hyp in hypotheses:
+            if isinstance(hyp, str):
+                hyp = {'statement': hyp}
+            elif not isinstance(hyp, dict):
+                continue
+                
             stmt = hyp.get('statement', '')
-            if not stmt:
+            if not isinstance(stmt, str) or not stmt.strip():
                 continue
             nid = self._process_statement(
                 stmt, existing_embeddings, source, NodeType.HYPOTHESIS,

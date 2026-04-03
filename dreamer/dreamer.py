@@ -16,7 +16,7 @@ from llm_utils import llm_call, require_json
 DEFAULT_STEPS       = 20
 DEFAULT_TEMP        = 0.7
 DEPTH_STEPS         = 3
-VISITED_PENALTY     = 0.25
+VISITED_PENALTY     = 0.45
 
 # mode modifiers
 MODE_TEMP_BOOST = {
@@ -51,6 +51,7 @@ class DreamStep:
     answer_detail:   str  = ""
     depth_triggered: bool = False
     mission_advance: bool = False
+    mission_strength: float = 0.0
 
 @dataclass
 class DreamLog:
@@ -89,16 +90,19 @@ From: "{from_node}"
 Via [{edge_type}]: "{edge_narration}"
 To: "{to_node}"
 
-Narrate this mental journey in 2-4 sentences. Think like a scientist half-asleep —
-associative, curious. Let the central question color your thinking without forcing it.
+Narrate this mental journey in 2-4 sentences. Be technically precise and dense. DO NOT write qualitative fluff. State explicitly what the structural mechanism is if one exists. Let the central question color your thinking without forcing it.
 
-If something is unresolved, ask ONE question starting with "Q:"
+If something is unresolved or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
 
-Classify any insight:
-- INSIGHT: surface — shared vocabulary or theme only
-- INSIGHT: structural — same relational pattern between domains
-- INSIGHT: isomorphism — formal mathematical or logical equivalence
-- INSIGHT: none
+Classify any insight strictly:
+- INSIGHT: none (Default)
+- INSIGHT: surface (Shares vocabulary, topic, or abstract theme. NOT a deep insight.)
+- INSIGHT: structural (Requires an exact 1-to-1 mechanistic mapping. e.g., A acts on B exactly as X acts on Y. If you cannot state the mechanism map explicitly, it is merely surface.)
+- INSIGHT: isomorphism (Exact formal/mathematical equivalence)
+
+WARNING: Avoid superficial analogies.
+BAD structural insight: "Both mitochondria and server farms produce energy." (This is merely a surface analogy).
+GOOD structural insight: "The process of synaptic pruning during REM sleep structurally maps to simulated annealing escaping local minima via stochastic noise."
 """
 
 NARRATION_WANDERING = """
@@ -108,16 +112,19 @@ From: "{from_node}"
 Via [{edge_type}]: "{edge_narration}"
 To: "{to_node}"
 
-Narrate this mental journey in 2-4 sentences. Let your mind wander freely —
-no destination, just association. Be playful, unexpected, open.
+Narrate this mental journey in 2-4 sentences. Be technically precise and dense. DO NOT write qualitative fluff. Make unexpected but scientifically rigorous connections. State explicitly what the structural mechanism is if one exists.
 
-If something is intriguing, ask ONE question starting with "Q:"
+If something is intriguing or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
 
-Classify any insight:
-- INSIGHT: surface
-- INSIGHT: structural
-- INSIGHT: isomorphism
-- INSIGHT: none
+Classify any insight strictly:
+- INSIGHT: none (Default)
+- INSIGHT: surface (Shares vocabulary, topic, or abstract theme. NOT a deep insight.)
+- INSIGHT: structural (Requires an exact 1-to-1 mechanistic mapping. e.g., A acts on B exactly as X acts on Y. If you cannot state the mechanism map explicitly, it is merely surface.)
+- INSIGHT: isomorphism (Exact formal/mathematical equivalence)
+
+WARNING: Avoid superficial analogies.
+BAD structural insight: "Both mitochondria and server farms produce energy." (This is merely a surface analogy).
+GOOD structural insight: "The process of synaptic pruning during REM sleep structurally maps to simulated annealing escaping local minima via stochastic noise."
 """
 
 NARRATION_TRANSITIONAL = """
@@ -132,15 +139,19 @@ From: "{from_node}"
 Via [{edge_type}]: "{edge_narration}"
 To: "{to_node}"
 
-Narrate in 2-4 sentences. Make unexpected connections. Be wild but coherent.
+Narrate in 2-4 sentences. Make unexpected connections. Be technically precise and dense. DO NOT write qualitative fluff. State explicitly what the structural mechanism is if one exists.
 
-If something sparks, ask ONE question starting with "Q:"
+If something sparks or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
 
-Classify any insight:
-- INSIGHT: surface
-- INSIGHT: structural
-- INSIGHT: isomorphism
-- INSIGHT: none
+Classify any insight strictly:
+- INSIGHT: none (Default)
+- INSIGHT: surface (Shares vocabulary, topic, or abstract theme. NOT a deep insight.)
+- INSIGHT: structural (Requires an exact 1-to-1 mechanistic mapping. e.g., A acts on B exactly as X acts on Y. If you cannot state the mechanism map explicitly, it is merely surface.)
+- INSIGHT: isomorphism (Exact formal/mathematical equivalence)
+
+WARNING: Avoid superficial analogies.
+BAD structural insight: "Both mitochondria and server farms produce energy." (This is merely a surface analogy).
+GOOD structural insight: "The process of synaptic pruning during REM sleep structurally maps to simulated annealing escaping local minima via stochastic noise."
 """
 
 MISSION_ADVANCE_PROMPT = """
@@ -151,14 +162,12 @@ Connection made: "{narration}"
 Does this meaningfully advance the central question?
 
 Strength rubric:
-- 0.1-0.3: Tangential — relates to the same broad topic but doesn't directly inform the question
-  Example: If question is "How does sleep aid creativity?" and idea is "The brain uses glucose" — tangential.
-- 0.4-0.6: Relevant — provides useful context or a building block, but doesn't answer the question
-  Example: "REM sleep involves heightened acetylcholine" — relevant context but not a direct advance.
-- 0.7-0.85: Advancing — directly informs a possible answer or resolves a sub-question
-  Example: "Studies show REM dreamers score higher on remote association tests" — a clear advance.
-- 0.9-1.0: Breakthrough — fundamentally changes understanding of the question. VERY rare.
-  Example: "A mechanism was identified where memory replay during REM loosens associative constraints" — breakthrough.
+- 0.1-0.3: Tangential — Relates to the same topic but does not inform the question.
+- 0.4-0.6: Relevant context — Provides useful background but is NOT an advance.
+- 0.7-0.85: Advancing — ONLY assign if it provides a direct missing piece or evidence to resolve the mission.
+- 0.9-1.0: Breakthrough
+
+IMPORTANT: Do NOT assign a rating >= 0.5 unless the idea provides *direct* evidence or a *missing piece* to answer the mission. Shared topic alone must be < 0.5.
 
 Respond with JSON:
 {{
@@ -215,7 +224,9 @@ You landed on: "{node}"
 It connects to: "{question}"
 Connection: {explanation}
 
-Explore this in 2-3 sentences. End with one follow-up question starting with "Q:"
+Explore this in 2-3 sentences. Be technically precise. DO NOT write qualitative fluff.
+End with ONE highly specific, empirically testable research question starting with "Q:". 
+The question MUST propose a specific measurement, variable, or intervention. Avoid generic inquiries.
 """
 
 SUMMARY_FOCUSED = """
@@ -278,9 +289,10 @@ Respond with ONLY the node ID.
 """
 
 class Dreamer:
-    def __init__(self, brain: Brain, research_agenda=None):
+    def __init__(self, brain: Brain, research_agenda=None, critic=None):
         self.brain           = brain
         self.research_agenda = research_agenda
+        self.critic          = critic
         self._embedding_cache = {}
 
     def _llm(self, prompt: str, temperature: float = 0.7) -> str:
@@ -445,7 +457,7 @@ class Dreamer:
             weight += 0.3
 
         if target_id in visited:
-            weight -= VISITED_PENALTY
+            weight = (weight * 0.1) - VISITED_PENALTY
 
         noise = random.gauss(0, temperature * 0.3)
         return max(0.001, weight + noise)
@@ -514,11 +526,12 @@ class Dreamer:
         raw = self._llm(MISSION_ADVANCE_PROMPT.format(
             mission=mission['question'],
             node=node_data['statement'],
-            narration=narration), temperature=0.4)
+            narration=narration), temperature=0.1)
         try:
             result = require_json(raw, default={})
-            if result.get('advances') and result.get('strength', 0) > 0.5:
-                return True, result.get('explanation', ''), result.get('strength', 0.5)
+            strength = float(result.get('strength', 0.0))
+            is_adv = result.get('advances', False) and strength > 0.5
+            return is_adv, result.get('explanation', ''), strength
         except (json.JSONDecodeError, ValueError):
             pass
         return False, "", 0.0
@@ -555,7 +568,7 @@ class Dreamer:
             mission_line=mission_line,
             node=node_data['statement'],
             question=question,
-            explanation=explanation), temperature=0.85)
+            explanation=explanation), temperature=0.5)
         lines  = raw.strip().split('\n')
         q_line = next((l for l in lines if l.startswith('Q:')), "")
         followup = q_line[2:].strip() if q_line else ""
@@ -572,13 +585,20 @@ class Dreamer:
             edge_narration = edge.get('narration', '') if edge else ''
             raw = self._llm(self._narration_prompt(
                 current_data['statement'], edge_type,
-                edge_narration, next_data['statement']), temperature=0.85)
+                edge_narration, next_data['statement']), temperature=0.5)
             narration, _, is_insight, depth = self._parse_narration(raw)
+            
+            mission_advance = False
+            mission_strength = 0.0
+            if mission:
+                mission_advance, _, mission_strength = self._check_mission_advance(next_data, narration)
+
             ds = DreamStep(
                 step=step_offset+d, from_id=current_id, to_id=next_id,
                 edge_type=edge_type, edge_narration=edge_narration,
                 narration=narration, is_insight=is_insight,
-                insight_depth=depth)
+                insight_depth=depth, mission_advance=mission_advance, 
+                mission_strength=mission_strength)
             log.steps.append(ds)
             visited.add(next_id)
             self.brain.update_node(next_id, activated_at=time.time())
@@ -597,7 +617,8 @@ class Dreamer:
 
     def dream(self, mode=DreamMode.WANDERING, steps=DEFAULT_STEPS,
               temperature=DEFAULT_TEMP, seed_id=None,
-              run_nrem=True, log_path="logs/dream_latest.json"):
+              run_nrem=True, log_path="logs/dream_latest.json",
+              visited_set=None):
 
         brain_mode    = self.brain.get_mode()
         scientificness= self.brain.scientificness
@@ -607,7 +628,7 @@ class Dreamer:
         steps       += MODE_STEPS_BOOST.get(brain_mode, 0)
 
         log          = DreamLog(mode=mode.value, brain_mode=brain_mode)
-        visited      = set()
+        visited      = visited_set if visited_set is not None else set()
         questions    = []
         q_embeddings = []
         mission      = self._mission_text()
@@ -646,7 +667,7 @@ class Dreamer:
 
             raw = self._llm(self._narration_prompt(
                 current['statement'], edge_type,
-                edge_narration, next_node['statement']), temperature=0.85)
+                edge_narration, next_node['statement']), temperature=0.5)
             narration, question, is_insight, insight_depth = \
                 self._parse_narration(raw)
 
@@ -658,7 +679,8 @@ class Dreamer:
             mission_advance = False
             mission_explanation = ""
             mission_strength = 0.0
-            if is_insight or match_grade == 'strong':
+            
+            if mission:
                 mission_advance, mission_explanation, mission_strength = \
                     self._check_mission_advance(next_node, narration)
 
@@ -695,22 +717,33 @@ class Dreamer:
                     "isomorphism": EdgeType.DEEP_ISOMORPHISM,
                 }
                 etype = type_map.get(insight_depth, EdgeType.STRUCTURAL_ANALOGY)
-                if not (self.brain.graph.has_edge(current_id, next_id) or
-                        self.brain.graph.has_edge(next_id, current_id)):
-                    dream_edge = Edge(
-                        type=etype, narration=narration,
-                        weight=ANALOGY_WEIGHTS.get(etype, 0.4),
-                        confidence=0.45, source=EdgeSource.DREAM,
-                        analogy_depth=insight_depth)
-                    self.brain.add_edge(current_id, next_id, dream_edge)
-                    new_edge = True
-                self.brain.restructure_around_insight(
-                    current_id, next_id, narration, edge_type=etype.value)
+                
+                # ── System 2 gating for high-stakes analogies ──
+                requires_review = self.critic is not None and insight_depth in ["structural", "isomorphism"]
+                
+                if not requires_review:
+                    if not (self.brain.graph.has_edge(current_id, next_id) or
+                            self.brain.graph.has_edge(next_id, current_id)):
+                        dream_edge = Edge(
+                            type=etype, narration=narration,
+                            weight=ANALOGY_WEIGHTS.get(etype, 0.4),
+                            confidence=0.45, source=EdgeSource.DREAM,
+                            analogy_depth=insight_depth)
+                        self.brain.add_edge(current_id, next_id, dream_edge)
+                        new_edge = True
+                    self.brain.restructure_around_insight(
+                        current_id, next_id, narration, edge_type=etype.value)
+                else:
+                    print(f"            [System 2] High-depth insight buffered for morning review")
+
                 log.insights.append({
                     "step": step, "from": current['statement'],
                     "to": next_node['statement'],
+                    "from_node_id": current_id,
+                    "to_node_id": next_id,
                     "narration": narration, "depth": insight_depth,
-                    "mission_linked": mission_advance
+                    "mission_linked": mission_advance,
+                    "requires_review": requires_review
                 })
 
             if match_grade != 'none':
@@ -745,7 +778,8 @@ class Dreamer:
                 new_edge=new_edge, answer_match=match_grade,
                 answer_detail=match_explanation,
                 depth_triggered=depth_triggered,
-                mission_advance=mission_advance)
+                mission_advance=mission_advance,
+                mission_strength=mission_strength)
             log.steps.append(ds)
             self.brain.update_node(next_id, activated_at=time.time())
             visited.add(next_id)
@@ -780,6 +814,42 @@ class Dreamer:
             self._summary_prompt(step_text, answer_text, mission_text),
             temperature=0.7
         )
+
+        # ── System 2 Post-Dream Review ──
+        if self.critic:
+            pending = [ins for ins in log.insights if ins.get("requires_review")]
+            if pending:
+                print("\n── System 2 Morning Review (Dream Insights) ──")
+                from critic.critic import CandidateThought, Verdict
+                for ins in pending:
+                    depth = ins["depth"]
+                    candidate = CandidateThought(
+                        claim=ins["narration"],
+                        source_module="dreamer",
+                        proposed_type="structural_analogy" if depth == "structural" else "deep_isomorphism",
+                        importance=0.75 if depth == "structural" else 0.85,
+                        edge_type=depth,
+                        node_a_id=ins["from_node_id"],
+                        node_b_id=ins["to_node_id"]
+                    )
+                    critic_log = self.critic.evaluate_with_refinement(candidate)
+                    if critic_log.verdict == Verdict.ACCEPT:
+                        etype = EdgeType.DEEP_ISOMORPHISM if depth == "isomorphism" else EdgeType.STRUCTURAL_ANALOGY
+                        final_claim = critic_log.refinement_note or candidate.claim
+                        if not (self.brain.graph.has_edge(candidate.node_a_id, candidate.node_b_id) or
+                                self.brain.graph.has_edge(candidate.node_b_id, candidate.node_a_id)):
+                            dream_edge = Edge(
+                                type=etype, narration=final_claim,
+                                weight=ANALOGY_WEIGHTS.get(etype, 0.4),
+                                confidence=critic_log.confidence, source=EdgeSource.DREAM,
+                                analogy_depth=depth)
+                            self.brain.add_edge(candidate.node_a_id, candidate.node_b_id, dream_edge)
+                        self.brain.restructure_around_insight(
+                            candidate.node_a_id, candidate.node_b_id, 
+                            final_claim, edge_type=etype.value
+                        )
+                    elif critic_log.verdict == Verdict.DEFER:
+                        self.critic.route_deferred(candidate)
 
         import os
         os.makedirs("logs", exist_ok=True)

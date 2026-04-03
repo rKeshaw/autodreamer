@@ -106,10 +106,16 @@ class DreamerScheduler:
         self.insight_buffer = InsightBuffer(self.brain,
                                             embedding_index=self.emb_index)
 
+        # System 2 gatekeeper
+        from critic.critic import Critic
+        self.critic = Critic(self.brain, embedding_index=self.emb_index,
+                             insight_buffer=self.insight_buffer)
+
         self.ingestor    = Ingestor(self.brain, research_agenda=self.observer,
                                     embedding_index=self.emb_index,
                                     insight_buffer=self.insight_buffer)
-        self.dreamer     = Dreamer(self.brain, research_agenda=self.observer)
+        self.dreamer     = Dreamer(self.brain, research_agenda=self.observer,
+                                   critic=self.critic)
         self.consolidator= Consolidator(self.brain, observer=self.observer,
                                          embedding_index=self.emb_index,
                                          insight_buffer=self.insight_buffer)
@@ -120,7 +126,8 @@ class DreamerScheduler:
                                   notebook=self.notebook)
         self.sandbox     = Sandbox(self.brain, observer=self.observer)
         self.thinker     = Thinker(self.brain, observer=self.observer,
-                                   embedding_index=self.emb_index)
+                                   embedding_index=self.emb_index,
+                                   critic=self.critic)
 
         signal.signal(signal.SIGINT,  self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)

@@ -163,10 +163,12 @@ class ThinkingLog:
 # ── Thinker ───────────────────────────────────────────────────────────────────
 
 class Thinker:
-    def __init__(self, brain: Brain, observer=None, embedding_index=None):
+    def __init__(self, brain: Brain, observer=None, embedding_index=None,
+                 critic=None):
         self.brain    = brain
         self.observer = observer
         self.index    = embedding_index
+        self.critic   = critic   # System 2 gating (optional)
 
     def _build_context(self, question: str, max_nodes: int = 8) -> str:
         """Build relevant context from the graph for a given question."""
@@ -354,25 +356,69 @@ class Thinker:
                 role="precise"
             )
 
-        # Store insight in graph
+        # ── System 2 gating ──
+        # Route insight through Critic before graph insertion
         if log.insight and len(log.insight) > 15:
-            node = Node(
-                statement      = log.insight,
-                node_type      = NodeType.SYNTHESIS,
-                cluster        = "thinking",
-                status         = NodeStatus.UNCERTAIN,
-                importance     = 0.7,
-                source_quality = 0.6
-            )
-            nid = self.brain.add_node(node)
-            log.node_id = nid
+            if self.critic:
+                from critic.critic import CandidateThought, Verdict
+                candidate = CandidateThought(
+                    claim         = log.insight,
+                    source_module = "thinker",
+                    proposed_type = "synthesis",
+                    importance    = 0.7,
+                    context       = log.reasoning,
+                )
+                critic_log = self.critic.evaluate_with_refinement(candidate)
 
-            if self.index:
-                self.index.add(nid, shared_embed(log.insight))
+                if critic_log.verdict == Verdict.ACCEPT:
+                    # Use critic-assigned confidence instead of default
+                    final_claim = log.insight
+                    confidence  = critic_log.confidence
+                    node = Node(
+                        statement      = final_claim,
+                        node_type      = NodeType.SYNTHESIS,
+                        cluster        = "thinking",
+                        status         = NodeStatus.UNCERTAIN,
+                        importance     = confidence,
+                        source_quality = confidence
+                    )
+                    nid = self.brain.add_node(node)
+                    log.node_id = nid
+                    if self.index:
+                        self.index.add(nid, shared_embed(final_claim))
+                    self.brain.focus_on(nid)
+                    print(f"  ✓ Insight accepted (conf={confidence:.2f}): "
+                          f"{final_claim[:80]}...")
 
-            # Add to working memory
-            self.brain.focus_on(nid)
-            print(f"  Insight: {log.insight[:80]}...")
+                elif critic_log.verdict == Verdict.REJECT:
+                    print(f"  ✗ Insight rejected: {critic_log.rejection_reason}")
+                    log.insight = ""  # clear so callers know it was rejected
+
+                elif critic_log.verdict == Verdict.DEFER:
+                    print(f"  ◇ Insight deferred to insight buffer")
+                    self.critic.route_deferred(candidate)
+                    log.insight = ""  # clear — not in graph yet
+
+                else:  # REFINE exhausted → treated as DEFER by evaluate_with_refinement
+                    print(f"  ◇ Insight deferred after refinement")
+                    log.insight = ""
+
+            else:
+                # No critic — original behavior (direct insertion)
+                node = Node(
+                    statement      = log.insight,
+                    node_type      = NodeType.SYNTHESIS,
+                    cluster        = "thinking",
+                    status         = NodeStatus.UNCERTAIN,
+                    importance     = 0.7,
+                    source_quality = 0.6
+                )
+                nid = self.brain.add_node(node)
+                log.node_id = nid
+                if self.index:
+                    self.index.add(nid, shared_embed(log.insight))
+                self.brain.focus_on(nid)
+                print(f"  Insight: {log.insight[:80]}...")
 
         log.duration = time.time() - start
         print(f"  Thinking complete ({log.duration:.1f}s)")

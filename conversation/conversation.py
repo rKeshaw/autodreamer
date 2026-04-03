@@ -81,11 +81,12 @@ Respond ONLY with JSON. No preamble.
 
 class Conversationalist:
     def __init__(self, brain: Brain, observer=None, embedding_index=None,
-                 ingestor=None):
+                 ingestor=None, notebook=None):
         self.brain     = brain
         self.observer  = observer
         self.index     = embedding_index
         self.ingestor  = ingestor
+        self.notebook  = notebook
         self.history: list[dict] = []
 
     def _llm(self, messages: list[dict], temperature: float = 0.7) -> str:
@@ -99,8 +100,8 @@ class Conversationalist:
 
         # Running hypothesis
         hypothesis = "None yet."
-        if self.observer and hasattr(self.observer, 'running_hypothesis'):
-            hypothesis = getattr(self.observer, 'running_hypothesis', '') or "None yet."
+        if self.notebook and getattr(self.notebook, 'running_hypothesis', ''):
+            hypothesis = self.notebook.running_hypothesis
 
         # Relevant nodes via embedding similarity
         relevant_nodes_text = "None found."

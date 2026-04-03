@@ -213,7 +213,7 @@ class Thinker:
         if self.observer and hasattr(self.observer, 'agenda'):
             open_items = [
                 item for item in self.observer.agenda
-                if item.status == 'open'
+                if not item.resolved
             ]
             if open_items:
                 # Pick highest priority

@@ -25,6 +25,8 @@ from embedding_index import EmbeddingIndex
 from embedding import embed as shared_embed
 from conversation.conversation import Conversationalist
 from thinker.thinker import Thinker
+from insight_buffer import InsightBuffer
+from critic.critic import Critic
 
 BRAIN_PATH    = "data/brain.json"
 OBSERVER_PATH = "data/observer.json"
@@ -95,17 +97,48 @@ try:
 except (FileNotFoundError, Exception):
     emb_index = EmbeddingIndex.build_from_brain(brain, shared_embed)
 
-ingestor     = Ingestor(brain, research_agenda=observer, embedding_index=emb_index)
-dreamer      = Dreamer(brain, research_agenda=observer)
-consolidator = Consolidator(brain, observer=observer, embedding_index=emb_index)
-researcher   = Researcher(brain, observer=observer, depth="standard")
 notebook     = Notebook(brain, observer=observer)
-sandbox      = Sandbox(brain, observer=observer)
-reader       = Reader(brain, observer=observer, notebook=notebook)
-conversation = Conversationalist(
-    brain, observer=observer, embedding_index=emb_index, ingestor=ingestor
+insight_buffer = InsightBuffer(brain, embedding_index=emb_index)
+critic = Critic(brain, embedding_index=emb_index, insight_buffer=insight_buffer)
+ingestor     = Ingestor(
+    brain,
+    research_agenda=observer,
+    embedding_index=emb_index,
+    insight_buffer=insight_buffer
 )
-thinker = Thinker(brain, observer=observer, embedding_index=emb_index)
+dreamer      = Dreamer(brain, research_agenda=observer, critic=critic)
+consolidator = Consolidator(
+    brain,
+    observer=observer,
+    embedding_index=emb_index,
+    insight_buffer=insight_buffer
+)
+researcher   = Researcher(
+    brain,
+    observer=observer,
+    depth="standard",
+    ingestor=ingestor
+)
+sandbox      = Sandbox(brain, observer=observer)
+reader       = Reader(
+    brain,
+    observer=observer,
+    notebook=notebook,
+    ingestor=ingestor
+)
+conversation = Conversationalist(
+    brain,
+    observer=observer,
+    embedding_index=emb_index,
+    ingestor=ingestor,
+    notebook=notebook
+)
+thinker = Thinker(
+    brain,
+    observer=observer,
+    embedding_index=emb_index,
+    critic=critic
+)
 
 def save_state():
     with state_lock:

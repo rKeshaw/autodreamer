@@ -118,10 +118,16 @@ class ResearchLog:
  
 class Researcher:
     def __init__(self, brain: Brain, observer=None,
-                 depth: str = RESEARCH_DEPTH):
+                 depth: str = RESEARCH_DEPTH, ingestor=None,
+                 embedding_index=None, insight_buffer=None):
         self.brain    = brain
         self.observer = observer
-        self.ingestor = Ingestor(brain, research_agenda=observer)
+        self.ingestor = ingestor or Ingestor(
+            brain,
+            research_agenda=observer,
+            embedding_index=embedding_index,
+            insight_buffer=insight_buffer
+        )
         self.depth    = DEPTH_PROFILES.get(depth, DEPTH_PROFILES["standard"])
         self.log      = ResearchLog()
  

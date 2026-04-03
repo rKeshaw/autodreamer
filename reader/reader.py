@@ -118,11 +118,17 @@ class AbsorptionResult:
 # ── Reader ────────────────────────────────────────────────────────────────────
 
 class Reader:
-    def __init__(self, brain: Brain, observer=None, notebook=None):
+    def __init__(self, brain: Brain, observer=None, notebook=None,
+                 ingestor=None, embedding_index=None, insight_buffer=None):
         self.brain    = brain
         self.observer = observer
         self.notebook = notebook
-        self.ingestor = Ingestor(brain, research_agenda=observer)
+        self.ingestor = ingestor or Ingestor(
+            brain,
+            research_agenda=observer,
+            embedding_index=embedding_index,
+            insight_buffer=insight_buffer
+        )
         self.reading_list: list[ReadingEntry] = []
         self._load_list()
 

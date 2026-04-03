@@ -21,6 +21,7 @@ from thinker.thinker import Thinker
 from insight_buffer import InsightBuffer
 from embedding_index import EmbeddingIndex
 from embedding import embed as shared_embed
+from conversation.conversation import Conversationalist
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -119,15 +120,30 @@ class DreamerScheduler:
         self.consolidator= Consolidator(self.brain, observer=self.observer,
                                          embedding_index=self.emb_index,
                                          insight_buffer=self.insight_buffer)
-        self.researcher  = Researcher(self.brain, observer=self.observer,
-                                      depth=RESEARCH_DEPTH)
+        self.researcher  = Researcher(
+            self.brain,
+            observer=self.observer,
+            depth=RESEARCH_DEPTH,
+            ingestor=self.ingestor
+        )
         self.notebook    = Notebook(self.brain, observer=self.observer)
-        self.reader      = Reader(self.brain, observer=self.observer,
-                                  notebook=self.notebook)
+        self.reader      = Reader(
+            self.brain,
+            observer=self.observer,
+            notebook=self.notebook,
+            ingestor=self.ingestor
+        )
         self.sandbox     = Sandbox(self.brain, observer=self.observer)
         self.thinker     = Thinker(self.brain, observer=self.observer,
                                    embedding_index=self.emb_index,
                                    critic=self.critic)
+        self.conversation = Conversationalist(
+            self.brain,
+            observer=self.observer,
+            embedding_index=self.emb_index,
+            ingestor=self.ingestor,
+            notebook=self.notebook
+        )
 
         signal.signal(signal.SIGINT,  self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)

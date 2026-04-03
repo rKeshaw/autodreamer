@@ -135,8 +135,9 @@ def bootstrap(mission: str, mission_context: str = "",
 
     observer     = Observer(brain)
     notebook     = Notebook(brain, observer=observer)
-    reader       = Reader(brain, observer=observer, notebook=notebook)
     ingestor     = Ingestor(brain, embedding_index=emb_index)
+    reader       = Reader(brain, observer=observer, notebook=notebook,
+                          ingestor=ingestor)
     thinker      = Thinker(brain, observer=observer, embedding_index=emb_index)
 
     # ── Step 1: Set mission ───────────────────────────────────────────────────

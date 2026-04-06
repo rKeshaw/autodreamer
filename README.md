@@ -6,7 +6,6 @@
   <p align="center">
     <a href="#quickstart">Quickstart</a> •
     <a href="#architecture">Architecture</a> •
-    <a href="#the-daily-cycle">Daily Cycle</a> •
     <a href="#modules">Modules</a> •
     <a href="#configuration">Configuration</a> •
     <a href="#license">License</a>
@@ -17,30 +16,28 @@
 
 AutoScientist is an **autonomous scientific research system** that builds and maintains a knowledge graph by reading papers, forming hypotheses, dreaming about connections between ideas, and consolidating knowledge — all on a continuous daily schedule, without human intervention.
 
-It doesn't just retrieve information. It **thinks** about it.
+It uses a **dual-process cognitive architecture** (Kahneman's System 1 / System 2): fast intuitive reasoning (Thinker, Dreamer) is adversarially checked by a slow, skeptical Critic before insights enter the knowledge graph.
 
-## ✨ Key Features
+## Features
 
-| Feature | Description |
-|---------|-------------|
-| 🌐 **Knowledge Graph** | NetworkX-backed graph with typed nodes (concepts, hypotheses, questions, syntheses) and typed edges (supports, causes, contradicts, analogy) |
-| 🔍 **Autonomous Research** | Searches Wikipedia & arXiv, reads articles, extracts concepts, and links them into the graph |
-| 🌙 **Dream Cycles** | Walks the knowledge graph at night, finding unexpected connections between disparate ideas |
+| | |
+|---|---|
+| 🧠 **Dual-Process Cognition** | System 1 (Thinker/Dreamer) generates ideas; System 2 (Critic) gates them via adversarial dialogue |
+| 🌐 **Knowledge Graph** | NetworkX-backed graph with typed nodes and edges |
+| 🔍 **Autonomous Research** | Searches Wikipedia & arXiv, extracts concepts, links them into the graph |
+| 🌙 **Dream Cycles** | Nightly graph walks finding unexpected analogies across domains |
 | 🧪 **Computational Sandbox** | Auto-generates and runs Python experiments to test hypotheses |
-| 🤔 **Thinker Module** | 5 reasoning patterns: dialectical, analogical, reductive, experimental, integrative |
-| ✍️ **Writing Phase** | Forces clarity by synthesizing ideas into structured essays |
-| 📓 **Research Notebook** | Persistent journal: morning entries, field notes, evening reflections, breakthroughs |
-| 💡 **Delayed Insight Buffer** | Near-miss idea pairs are saved and re-evaluated as new knowledge arrives — mimicking "shower insights" |
-| 🔄 **Self-Regulating Knowledge** | Confidence decay on stale nodes forces re-verification; working memory biases active threads |
-| 💬 **Conversational Interface** | Chat with the scientist through a web UI |
-| ⚡ **FAISS-Backed Embeddings** | Scalable vector similarity search for thousands of concepts |
+| 💡 **Insight Buffer** | Near-miss ideas are saved and re-evaluated as knowledge grows |
+| 🔄 **Self-Regulating Knowledge** | Confidence decay on stale nodes; working memory biases active threads |
+| ⚡ **FAISS Embeddings** | Scalable vector similarity search via FAISS |
+| 💬 **Web UI** | Flask + SocketIO interface for graph, notebook, and chat |
 
 ## Quickstart
 
 ### Prerequisites
 
 - **Python 3.10+**
-- **[Ollama](https://ollama.ai)** running locally with at least one model pulled (default: `llama3.1:8b`)
+- **[Ollama](https://ollama.ai)** running locally with a model pulled (default: `mixtral:latest`)
 
 ### Installation
 
@@ -53,20 +50,15 @@ pip install -r requirements.txt
 ### Bootstrap a Research Brain
 
 ```bash
-# Start with any research question
 python bootstrap.py "How does sleep contribute to creative problem-solving?"
-
-# Or fork from a pre-built template brain
-python bootstrap.py --template general_scientist "Your question here"
 ```
 
 ### Launch the Web UI
 
 ```bash
 python gui/app.py
+# Open http://localhost:5000
 ```
-
-Then open **http://localhost:5000** in your browser. You'll see the knowledge graph, notebook, and chat interface.
 
 ### Start the Autonomous Scheduler
 
@@ -74,61 +66,53 @@ Then open **http://localhost:5000** in your browser. You'll see the knowledge gr
 python -m scheduler.scheduler
 ```
 
-The system will now run on a daily cycle automatically.
+Run a single phase manually:
+
+```bash
+python -m scheduler.scheduler --mode dream
+python -m scheduler.scheduler --mode thinking
+python -m scheduler.scheduler --mode cycle   # full cycle immediately
+```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        AutoScientist                             │
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │ Reader   │→ │ Ingestor │→ │  Brain   │← │ Insight Buffer   │  │
-│  │(Wikipedia│  │(extract  │  │(NetworkX │  │(near-miss pairs  │  │
-│  │ arXiv)   │  │ nodes &  │  │ graph +  │  │ re-evaluated     │  │
-│  └──────────┘  │ edges)   │  │ FAISS)   │  │ each cycle)      │  │
-│                └──────────┘  └────┬─────┘  └──────────────────┘  │
-│                                   │                              │
-│       ┌───────────────────────────┼───────────────────────┐      │
-│       │                           │                       │      │
-│  ┌────▼─────┐  ┌──────────┐  ┌────▼─────┐  ┌──────────┐   │      │
-│  │ Dreamer  │  │ Thinker  │  │Consolida-│  │ Sandbox  │   │      │
-│  │(night    │  │(5 reason-│  │tor (merge│  │(run code │   │      │
-│  │ walks)   │  │ patterns)│  │ & decay) │  │ tests)   │   │      │
-│  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘   │      │
-│       │                                                   │      │
-│  ┌────▼─────┐  ┌──────────┐  ┌──────────┐                 │      │
-│  │ Observer │  │ Notebook │  │Researcher│                 │      │
-│  │(track    │  │(journal) │  │(search & │                 │      │
-│  │ progress)│  └──────────┘  │ verify)  │                 │      │
-│  └──────────┘                └──────────┘                 │      │
-│       └───────────────────────────────────────────────────┘      │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │                    Scheduler (cron)                      │    │
-│  │  09:00 Research → 11:00 Think → 14:00 Read → 16:00 Write │    │
-│  │  20:00 Consolidate → 23:00 Dream                         │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │             llm_utils (unified LLM layer)                │    │
-│  │  Role-based model selection · Robust JSON parsing        │    │
-│  └──────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    AutoScientist                      │
+│                                                       │
+│  Reader → Ingestor → Brain (NetworkX + FAISS)         │
+│                          │                            │
+│        ┌─────────────────┼──────────────────┐         │
+│        │                 │                  │         │
+│    Dreamer           Thinker           Researcher     │
+│    (System 1)        (System 1)                       │
+│        │                 │                            │
+│        └────────┬─────────┘                           │
+│                 │                                     │
+│              Critic  ◄── System 2 gating              │
+│         (adversarial dialogue)                        │
+│                 │                                     │
+│        ┌────────┴──────────┐                          │
+│        │                   │                          │
+│   InsightBuffer       Knowledge Graph                 │
+│   (deferred ideas)    (accepted claims)               │
+│                                                       │
+│  Consolidator · Observer · Notebook · Sandbox         │
+│  Scheduler (cron) · GUI (Flask)                       │
+│  llm_utils (unified LLM layer)                        │
+└──────────────────────────────────────────────────────┘
 ```
 
-## The Daily Cycle
-
-AutoScientist operates on a **circadian rhythm** — six phases that mirror a human researcher's day:
+### Daily Cycle
 
 | Time | Phase | What Happens |
-|------|-------|-------------|
-| **09:00** | 🔬 Research | Picks top questions from the observer agenda, searches the web/arXiv, extracts relevant concepts into the graph |
-| **11:00** | 🤔 Thinking | Selects an open question and applies one of 5 reasoning strategies (dialectical, analogical, reductive, experimental, integrative) |
-| **14:00** | 📖 Reading | Absorbs articles from the reading list (Wikipedia, arXiv), adds new nodes and cross-domain connections |
-| **16:00** | ✍️ Writing | Synthesizes accumulated knowledge into structured essays — forces the system to articulate what it actually knows |
-| **20:00** | 🔧 Consolidation | Merges duplicate nodes, creates synthesis/abstraction nodes, detects gaps, decays stale confidence, re-evaluates insight buffer |
-| **23:00** | 🌙 Dreaming | Random-walks the knowledge graph, finding unexpected analogies and connections across domains |
+|------|-------|--------------|
+| **09:00** | 🔬 Research | Searches web/arXiv, extracts concepts into the graph |
+| **11:00** | 🤔 Thinking | Applies a reasoning strategy (dialectical, analogical, reductive, experimental, integrative); insights gated by Critic |
+| **14:00** | 📖 Reading | Absorbs articles from the reading list |
+| **16:00** | ✍️ Writing | Synthesizes accumulated knowledge into structured essays |
+| **20:00** | 🔧 Consolidation | Merges duplicates, decays stale nodes, re-evaluates insight buffer |
+| **23:00** | 🌙 Dreaming | Nightly graph walks finding unexpected connections; insights gated by Critic |
 
 ## Modules
 
@@ -136,189 +120,116 @@ AutoScientist operates on a **circadian rhythm** — six phases that mirror a hu
 
 | Module | Purpose |
 |--------|---------|
-| `graph/brain.py` | Knowledge graph — nodes, edges, types, mission tracking, working memory |
-| `embedding.py` | Sentence embedding via `sentence-transformers` |
-| `embedding_index.py` | FAISS-backed vector index for fast similarity search |
-| `llm_utils.py` | Unified LLM interface — role-based model selection, robust JSON parsing |
-| `config.py` | Threshold tuning and per-role model configuration |
-| `persistence.py` | Atomic JSON writes to prevent corruption |
+| `graph/brain.py` | Knowledge graph — nodes, edges, mission, working memory |
+| `embedding_index.py` | FAISS-backed vector index |
+| `llm_utils.py` | Unified LLM interface — role-based model selection, JSON parsing |
+| `config.py` | Thresholds, per-role model config, Critic config |
+| `insight_buffer.py` | Delayed insight mechanism — buffers near-miss pairs for re-evaluation |
+| `persistence.py` | Atomic JSON writes |
 
-### Cognitive Modules
+### Cognitive
 
 | Module | Purpose |
 |--------|---------|
-| `dreamer/` | Night-time graph walks with 3 modes: focused, wandering, transitional |
-| `thinker/` | Structured reasoning — 5 patterns, auto-selects the best strategy per question |
-| `consolidator/` | Evening knowledge maintenance — merge duplicates, synthesize, detect gaps, decay confidence |
-| `insight_buffer.py` | Delayed insight mechanism — saves near-miss pairs, re-evaluates as graph grows |
-| `observer/` | Meta-cognitive monitoring — tracks emergence, coherence, and mission progress |
+| `thinker/` | System 1 — structured reasoning with 5 patterns |
+| `dreamer/` | System 1 — nightly graph walks (wandering, focused, pressure modes) |
+| `critic/` | System 2 — adversarial multi-turn dialogue gating high-stakes claims |
+| `consolidator/` | Evening knowledge maintenance — merge, synthesize, decay, gap detection |
+| `observer/` | Meta-cognitive monitoring — mission progress, emergence signals, agenda |
 
 ### Knowledge Acquisition
 
 | Module | Purpose |
 |--------|---------|
-| `reader/` | Reads Wikipedia articles and arXiv papers, manages a prioritized reading list |
-| `researcher/` | Active research — generates search queries, evaluates relevance, extracts findings |
-| `ingestion/ingestor.py` | Converts raw text into graph nodes and edges with typed relationships |
+| `reader/` | Wikipedia/arXiv reader with prioritized reading list |
+| `researcher/` | Active research — generates queries, extracts findings |
+| `ingestion/` | Converts raw text → typed graph nodes and edges |
 
 ### Interface & Scheduling
 
 | Module | Purpose |
 |--------|---------|
-| `gui/app.py` | Flask + SocketIO web UI — graph visualization, notebook viewer, chat interface |
-| `notebook/` | Persistent research journal with typed entries (morning, field notes, evening, breakthrough) |
-| `conversation/` | Chat with the scientist — asks questions, ingests relevant responses into the graph |
-| `scheduler/` | APScheduler-based daily cycle automation |
-| `bootstrap.py` | Dynamic brain initialization — decomposes any research question into domains and seeds the graph |
-| `build_template.py` | Creates reusable template brains from general knowledge |
+| `gui/app.py` | Flask + SocketIO web UI |
+| `notebook/` | Persistent research journal |
+| `conversation/` | Chat interface that feeds responses into the graph |
+| `scheduler/` | APScheduler-based daily cycle |
+| `bootstrap.py` | Brain initialization from any research question |
+| `sandbox/` | Computational hypothesis testing |
 
 ## Configuration
 
 ### Model Selection (`config.py`)
 
-AutoScientist uses **role-based model routing** — different cognitive tasks can use different LLM models:
+Role-based model routing — different tasks can use different models:
 
 ```python
 class ModelConfig:
-    CREATIVE     = "llama3.1:8b"   # Dreaming, synthesis, analogies
-    PRECISE      = "llama3.1:8b"   # JSON extraction, factual answers
-    CODE         = "llama3.1:8b"   # Sandbox code generation
-    REASONING    = "llama3.1:8b"   # Thinker, chain-of-thought
-    CONVERSATION = "llama3.1:8b"   # Chat interface
+    CREATIVE     = "mixtral:latest"   # Dreaming, synthesis
+    PRECISE      = "mixtral:latest"   # JSON extraction
+    CODE         = "mixtral:latest"   # Sandbox experiments
+    REASONING    = "mixtral:latest"   # Thinker
+    CONVERSATION = "mixtral:latest"   # Chat
+    CRITIC       = "mixtral:latest"   # System 2 adversarial review
 ```
 
-Swap in larger models for critical tasks:
+Swap models per role as needed:
 ```python
-MODELS.CREATIVE  = "llama3.1:70b"   # Better dreaming with bigger model
-MODELS.PRECISE   = "qwen2.5:7b"     # Faster JSON extraction
+MODELS.CRITIC    = "llama3.1:70b"   # more rigorous System 2
+MODELS.CREATIVE  = "llama3.1:70b"   # better dreaming
 ```
 
-### Threshold Tuning (`config.py`)
+### Thresholds (`config.py`)
 
 ```python
 class ThresholdConfig:
-    MERGE_NODE          = 0.80   # Cosine similarity to merge near-duplicate nodes
-    DUPLICATE_MERGE     = 0.88   # Strict duplicate detection
-    WEAK_EDGE           = 0.60   # Minimum similarity for associative edges
-    COHERENCE           = 0.65   # Cross-domain insight quality threshold
-    GAP_CONFIDENCE      = 0.75   # Confidence needed to infer gap nodes
+    MERGE_NODE      = 0.72   # Cosine similarity to merge near-duplicate nodes
+    DUPLICATE_MERGE = 0.88   # Strict duplicate detection
+    WEAK_EDGE       = 0.58   # Minimum similarity for associative edges
+    COHERENCE       = 0.65   # Cross-domain insight quality threshold
+    GAP_CONFIDENCE  = 0.75   # Confidence needed to infer gap nodes
 ```
 
-### Insight Buffer Tuning (`insight_buffer.py`)
+### Critic / System 2 (`config.py`)
 
 ```python
-BUFFER_LOW       = 0.45   # Minimum similarity to enter the buffer (below WEAK_EDGE)
-MAX_EVALUATIONS  = 10     # Prune after this many re-evaluations without improvement
-MAX_BUFFER_SIZE  = 200    # Hard cap on buffered pairs
-NEIGHBOR_BOOST   = 0.05   # Similarity bonus per shared neighbor
+class CriticConfig:
+    ACTIVATION_THRESHOLD    = 0.65   # Minimum importance to trigger review
+    MAX_DIALOGUE_TURNS      = 3      # Adversarial rounds
+    ACCEPT_CONFIDENCE_FLOOR = 0.50   # Minimum confidence to ACCEPT
+    ALWAYS_REVIEW_TYPES     = ["hypothesis", "synthesis",
+                               "structural_analogy", "deep_isomorphism"]
+    BYPASS_TYPES            = ["concept", "associated", "surface_analogy"]
+    MAX_REFINE_ITERATIONS   = 2
 ```
 
-## Knowledge Graph Structure
+Critic verdicts: **ACCEPT** · **REFINE** · **REJECT** · **DEFER** (→ InsightBuffer)
+
+## Knowledge Graph
 
 ### Node Types
 
-| Type | Description |
-|------|-------------|
-| `concept` | A factual or theoretical idea extracted from text |
-| `hypothesis` | A testable claim with predicted answer and test method |
-| `question` | An open question generated by dreaming or research |
-| `answer` | A node that resolves a question |
-| `synthesis` | Emergent idea created by combining multiple nodes |
-| `gap` | Inferred missing link between two connected ideas |
-| `mission` | The central research question |
-| `empirical` | Result from a computational sandbox test |
+`concept` · `hypothesis` · `question` · `answer` · `synthesis` · `gap` · `mission` · `empirical`
 
 ### Edge Types
 
-| Type | Description |
-|------|-------------|
-| `supports` | Evidence or reasoning that backs another idea |
-| `causes` | Causal relationship |
-| `contradicts` | Logical tension or opposing evidence |
-| `surface_analogy` | Shared vocabulary or theme across domains |
-| `structural_analogy` | Same relational pattern (A:B :: X:Y) |
-| `deep_isomorphism` | Formal mathematical or logical equivalence |
-| `associated` | Weak associative link based on embedding similarity |
+`supports` · `causes` · `contradicts` · `surface_analogy` · `structural_analogy` · `deep_isomorphism` · `associated`
 
-## Project Structure
+## Data & Logs
 
 ```
-autoscientist/
-├── bootstrap.py           # Initialize a research brain from any question
-├── build_template.py      # Build reusable template brains
-├── config.py              # Thresholds + model configuration
-├── embedding.py           # Sentence embedding interface
-├── embedding_index.py     # FAISS vector index
-├── insight_buffer.py      # Delayed insight mechanism
-├── llm_utils.py           # Unified LLM layer (llm_call, require_json)
-├── persistence.py         # Atomic JSON persistence
-│
-├── graph/
-│   └── brain.py           # Core knowledge graph (NetworkX)
-│
-├── consolidator/
-│   └── consolidator.py    # Evening consolidation (7 steps)
-│
-├── conversation/
-│   └── conversation.py    # Chat interface with graph integration
-│
-├── dreamer/
-│   └── dreamer.py         # Night-time graph walks
-│
-├── gui/
-│   ├── app.py             # Flask web application
-│   └── templates/
-│       └── index.html     # Web UI
-│
-├── ingestion/
-│   └── ingestor.py        # Text → graph node/edge extraction
-│
-├── notebook/
-│   └── notebook.py        # Research journal
-│
-├── observer/
-│   └── observer.py        # Meta-cognitive monitoring
-│
-├── reader/
-│   └── reader.py          # Wikipedia/arXiv reader
-│
-├── researcher/
-│   └── researcher.py      # Active research agent
-│
-├── sandbox/
-│   └── sandbox.py         # Computational hypothesis testing
-│
-├── scheduler/
-│   └── scheduler.py       # Daily cycle automation
-│
-├── tests/
-│   └── test_embedding_index.py
-│
-├── thinker/
-│   └── thinker.py         # Structured reasoning (5 patterns)
-│
-├── requirements.txt
-├── README.md
-└── LICENSE                # GPL-3.0
+data/
+├── brain.json              # Knowledge graph state
+├── observer.json           # Observer state and agenda
+├── embedding_index/        # FAISS index
+├── insight_buffer.json     # Pending near-miss pairs
+└── daily_new_nodes.json    # Daily node ledger
+
+logs/
+├── cycle_log.json
+├── research_log.json
+├── notebook.json
+└── sandbox_results.json
 ```
-
-## Self-Regulating Knowledge
-
-AutoScientist treats knowledge as a **decaying asset**, not a permanent record:
-
-- **Confidence Decay**: Nodes not re-verified within 3 days lose `source_quality` at 2% per day. Dream-synthesized nodes (low initial quality) decay 2× faster. Floor at 0.05.
-- **Edge Pruning**: Weak edges with confidence below threshold are removed during consolidation.
-- **Working Memory Bias**: The dreamer has a 30% probability of starting its walk from a node currently in working memory, keeping active research threads alive.
-- **Delayed Insights**: Near-miss pairs (similarity 0.45-0.59) are buffered and re-evaluated each cycle. Shared neighbors boost the score. After 10 failed re-evaluations, pairs are pruned.
-
-## Prompt Engineering
-
-All 48 LLM prompts have been calibrated with:
-
-- **Scored rubrics** — every numeric output (strength, confidence, coherence) has a labeled scale with concrete examples at each level
-- **Negative examples** — synthesis, gap, and abstraction prompts include "bad example" demonstrations to prevent summarization
-- **Grading definitions** — categorical outputs (none/partial/strong) are defined with explicit tests ("could you write a conclusion?")
-- **Cross-domain depth verification** — the observer cross-checks claimed analogy depth against actual content
 
 ## Running Tests
 
@@ -326,32 +237,9 @@ All 48 LLM prompts have been calibrated with:
 pytest tests/ -v
 ```
 
-## Data Persistence
-
-All state is persisted to `data/`:
-
-```
-data/
-├── brain.json              # Full knowledge graph
-├── observer.json           # Observer state (agenda, signals)
-├── embedding_index/        # FAISS index files
-├── insight_buffer.json     # Pending near-miss pairs
-├── consolidation_latest.json
-└── daily_new_nodes.json    # Ledger for daily tracking
-```
-
-Logs are written to `logs/`:
-```
-logs/
-├── cycle_log.json          # Scheduler phase log
-├── research_log.json       # Research session details
-├── notebook.json           # All journal entries
-└── sandbox_results.json    # Computational experiment results
-```
-
 ## License
 
-This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
+[GNU General Public License v3.0](LICENSE)
 
 ---
 

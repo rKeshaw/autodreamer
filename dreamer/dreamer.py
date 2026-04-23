@@ -5,11 +5,12 @@ import re
 import numpy as np
 from enum import Enum
 from dataclasses import dataclass, field
-from graph.brain import (Brain, Edge, EdgeType, EdgeSource,
+from graph.brain import (Brain, Node, Edge, EdgeType, EdgeSource,
                          NodeStatus, NodeType, BrainMode, ANALOGY_WEIGHTS)
 from config import THRESHOLDS
 from embedding import embed as shared_embed
 from llm_utils import llm_call, require_json
+from scientist_workspace import ArtifactStatus
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -22,6 +23,13 @@ VISITED_PENALTY     = 0.45
 RECENT_CLUSTER_WINDOW = 4
 RECENT_CLUSTER_PENALTY = 0.18
 EXPLORATION_JUMP_PROB = 0.28
+MAX_DREAM_QUESTION_WORDS = 36
+QUESTION_CONTEXT_SIM_MIN = 0.20
+QUESTION_CONTEXT_TOKEN_OVERLAP_MIN = 2
+MISSION_ADVANCE_SIM_MIN = 0.26
+MISSION_ADVANCE_TOKEN_OVERLAP_MIN = 2
+HYPOTHESIS_CONTEXT_SIM_MIN = 0.18
+HYPOTHESIS_CONTEXT_TOKEN_OVERLAP_MIN = 3
 
 # mode modifiers
 MODE_TEMP_BOOST = {
@@ -98,6 +106,9 @@ To: "{to_node}"
 Narrate this mental journey in 2-4 sentences. Be technically precise and dense. DO NOT write qualitative fluff. State explicitly what the structural mechanism is if one exists. Let the central question color your thinking without forcing it.
 
 If something is unresolved or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
+Keep the question anchored to the entities and mechanisms already present in the supplied concepts.
+Do NOT introduce new equations, symbolic notation, named model families, or formal operators unless they already appear in the supplied concepts.
+Prefer direct experimental, observational, ablation, perturbation, or comparison questions in plain scientific prose.
 
 Classify any insight strictly:
 - INSIGHT: none (Default)
@@ -125,6 +136,9 @@ To: "{to_node}"
 Narrate this mental journey in 2-4 sentences. Be technically precise and dense. DO NOT write qualitative fluff. Make unexpected but scientifically rigorous connections. State explicitly what the structural mechanism is if one exists.
 
 If something is intriguing or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
+Keep the question anchored to the entities and mechanisms already present in the supplied concepts.
+Do NOT introduce new equations, symbolic notation, named model families, or formal operators unless they already appear in the supplied concepts.
+Prefer direct experimental, observational, ablation, perturbation, or comparison questions in plain scientific prose.
 
 Classify any insight strictly:
 - INSIGHT: none (Default)
@@ -157,6 +171,9 @@ To: "{to_node}"
 Narrate in 2-4 sentences. Make unexpected connections. Be technically precise and dense. DO NOT write qualitative fluff. State explicitly what the structural mechanism is if one exists.
 
 If something sparks or a new hypothesis emerges, ask ONE empirically testable, novel, and highly specific research question starting with "Q:". A good question should propose a measurement or intervention. Avoid generic questions like "How does X affect Y?".
+Keep the question anchored to the entities and mechanisms already present in the supplied concepts.
+Do NOT introduce new equations, symbolic notation, named model families, or formal operators unless they already appear in the supplied concepts.
+Prefer direct experimental, observational, ablation, perturbation, or comparison questions in plain scientific prose.
 
 Classify any insight strictly:
 - INSIGHT: none (Default)
@@ -315,6 +332,8 @@ Do NOT repeat the landed statement or the connection verbatim.
 If you cannot add a materially new mechanistic angle, respond EXACTLY with: NO_DEPTH
 End with ONE highly specific, empirically testable research question starting with "Q:". 
 The question MUST propose a specific measurement, variable, or intervention. Avoid generic inquiries.
+Keep the question anchored to the entities and mechanisms already present in the supplied concepts.
+Do NOT introduce new equations, symbolic notation, named model families, or formal operators unless they already appear in the supplied concepts.
 """
 
 SUMMARY_FOCUSED = """
@@ -325,13 +344,13 @@ Dream steps: {steps}
 Answer matches: {answers}
 Mission advances: {mission_advances}
 
-Write a 4-6 sentence morning notebook entry addressing:
-1. What the dream explored
-2. Key connections made
-3. Whether the central question was advanced
-4. Most pressing open questions
+Write 4-5 short scientific sentences:
+1. What mechanisms or mappings were explored
+2. Which points are still only speculative
+3. Whether any grounded mission advance occurred
+4. What question most needs follow-up
 
-First person. Sign off: — THE SCIENTIST
+No first person. No emotional language. No sign-off.
 """
 
 SUMMARY_WANDERING = """
@@ -339,13 +358,13 @@ You are summarizing a dream cycle. Brain mode: WANDERING (no mission — free as
 
 Dream steps: {steps}
 
-Write a 4-6 sentence morning notebook entry:
-1. What the dream explored
-2. What surprised you
-3. Any unexpected connections
-4. What you find yourself curious about
+Write 4-5 short scientific sentences:
+1. What domains or mechanisms were traversed
+2. Which connections remained weak or speculative
+3. Any structural mapping worth later validation
+4. What question emerged for later investigation
 
-First person. Playful tone. Sign off: — THE SCIENTIST
+No first person. No playful tone. No sign-off.
 """
 
 SUMMARY_TRANSITIONAL = """
@@ -355,9 +374,13 @@ The mind is reorganizing itself.
 
 Dream steps: {steps}
 
-Write a 4-6 sentence entry capturing the chaotic reorientation — ideas flying together,
-new connections forming rapidly, the mind finding its new gravitational center.
-Sign off: — THE SCIENTIST
+Write 4-5 short scientific sentences describing:
+1. Which prior concepts were recruited into the new mission
+2. Which tentative links appeared
+3. Which parts remain unsupported
+4. What should be validated next
+
+No first person. No dramatic language. No sign-off.
 """
 
 START_NODE_FOCUSED = """
@@ -376,14 +399,129 @@ Nodes: {nodes}
 Respond with ONLY the node ID.
 """
 
+
+DREAM_FROM_ANOMALY_PROMPT = """You are the Dreamer, a scientific anomaly analyst. A prior hypothesis was contradicted.
+
+Hypothesis (What we expected):
+{hypothesis}
+
+Contradicting Evidence (What we actually observed):
+{evidence}
+
+Generate ONE conservative next-step alternative that is directly motivated by the contradiction.
+Do not invent a new force, sector, field, geometry, symmetry, or observable unless the contradiction text already motivates it.
+If the evidence only supports a narrower discriminating question, return a hypothesis that explicitly stays provisional.
+
+Return your new hypothesis as JSON:
+{{
+  "new_hypothesis": "A single testable anomaly-driven claim.",
+  "explanation": "Why this follows from the contradiction, in one sentence."
+}}
+"""
+
 class Dreamer:
-    def __init__(self, brain: Brain, research_agenda=None, critic=None):
+
+
+    def __init__(self, brain: Brain, research_agenda=None, critic=None,
+                 observer=None, embedding_index=None):
         self.brain           = brain
-        self.research_agenda = research_agenda
+        self.research_agenda = research_agenda or observer
         self.critic          = critic
         self._embedding_cache = {}
 
+
+    def dream_from_anomaly(self, expected_hypothesis_id: str) -> dict | None:
+        hyp_node = self.brain.get_node(expected_hypothesis_id)
+        if not hyp_node:
+            return None
+            
+        print(f"\n  ── 🌪️  Anomaly Detection: Hypothesis Contradicted ──")
+        print(f"     Old: {hyp_node['statement'][:80]}...")
+        
+        evidence_texts = []
+        edges = self.brain.graph.in_edges(expected_hypothesis_id, data=True)
+        for u, v, data in edges:
+            if data.get('type') == EdgeType.CORRECTED_BY.value:
+                enode = self.brain.get_node(u)
+                if enode:
+                    evidence_texts.append(enode.get('statement', ''))
+                    
+        if not evidence_texts:
+            print("     Could not locate contradicting evidence. Aborting anomaly dream.")
+            return None
+            
+        evidence_str = "\n".join(f"- {t}" for t in evidence_texts)
+        
+        raw = self._llm(DREAM_FROM_ANOMALY_PROMPT.format(
+            hypothesis=hyp_node.get('statement', ''),
+            evidence=evidence_str
+        ), temperature=0.35)
+        
+        result = self._json_object(raw, default={"new_hypothesis": "", "explanation": ""})
+        new_hyp = result.get("new_hypothesis", "").strip()
+        explanation = result.get("explanation", "Generated from anomaly.")
+        
+        if not new_hyp:
+            return None
+
+        accepted, reviewed_claim, review_reason = self._critic_review_hypothesis(
+            new_hyp,
+            explanation,
+            evidence_str,
+            expected_status=ArtifactStatus.OPEN.value,
+        )
+        if not accepted:
+            if self.research_agenda and hasattr(self.research_agenda, "add_to_agenda"):
+                self.research_agenda.add_to_agenda(
+                    text=f"Test anomaly alternative: {new_hyp}",
+                    item_type="question",
+                    cycle=getattr(self.research_agenda, "cycle_count", 0),
+                    node_id="",
+                )
+            print(f"  ✗ Anomaly hypothesis deferred: {review_reason or 'critic rejected unsupported alternative'}")
+            return {
+                "status": "deferred",
+                "statement": new_hyp,
+                "explanation": review_reason or explanation,
+            }
+
+        new_hyp = reviewed_claim or new_hyp
+            
+        print(f"  ✨ Anomaly follow-up hypothesis: {new_hyp[:80]}...")
+        
+        node = Node(
+            statement=new_hyp,
+            node_type=NodeType.HYPOTHESIS,
+            status=NodeStatus.HYPOTHETICAL,
+            epistemic_status=ArtifactStatus.SPECULATIVE.value,
+            importance=0.9,
+            source_quality=0.8,
+            created_by="dreamer_anomaly",
+            cluster="anomaly_drift"
+        )
+        new_id = self.brain.add_node(node)
+        
+        from graph.brain import Edge
+        for u, v, data in edges:
+            if data.get('type') == EdgeType.CORRECTED_BY.value:
+                edge = Edge(
+                    type=EdgeType.SUPPORTS,
+                    narration=explanation,
+                    weight=0.8,
+                    confidence=0.7,
+                    source=EdgeSource.DREAM
+                )
+                self.brain.add_edge(u, new_id, edge)
+                
+        return {
+            "node_id": new_id,
+            "statement": new_hyp,
+            "explanation": explanation
+        }
+
     def _llm(self, prompt: str, temperature: float = 0.7) -> str:
+
+
         return llm_call(prompt, temperature=temperature, role="creative")
 
     def _embed(self, text: str) -> np.ndarray:
@@ -395,6 +533,39 @@ class Dreamer:
 
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(np.dot(a, b))
+
+    def _json_object(self, raw: str, default: dict | None = None) -> dict:
+        parsed = require_json(raw, default=default or {})
+        return parsed if isinstance(parsed, dict) else dict(default or {})
+
+    def _critic_review_hypothesis(self, hypothesis_text: str,
+                                  mechanism: str,
+                                  seed_claims_text: str,
+                                  expected_status: str = ArtifactStatus.OPEN.value) -> tuple[bool, str, str]:
+        if not self.critic:
+            return True, hypothesis_text, ""
+        from critic.critic import CandidateThought, Verdict
+
+        context = "\n".join(filter(None, [
+            "Seed findings:",
+            seed_claims_text,
+            "Proposed mechanism:",
+            mechanism,
+        ]))
+        candidate = CandidateThought(
+            claim=hypothesis_text,
+            source_module="dreamer",
+            proposed_type=NodeType.HYPOTHESIS.value,
+            importance=0.72,
+            context=context,
+            expected_status=expected_status,
+        )
+        review = self.critic.evaluate_with_refinement(candidate)
+        accepted = review.verdict == Verdict.ACCEPT
+        reviewed_claim = (
+            review.final_claim or review.refinement_note or hypothesis_text
+        )
+        return accepted, reviewed_claim, review.verdict_reason or review.rejection_reason or ""
 
     def _mission_text(self) -> str:
         if self.brain.is_wandering():
@@ -496,6 +667,104 @@ class Dreamer:
             return False
         return True
 
+    def _question_has_symbolic_overreach(self, question):
+        text = str(question or "")
+        if not text:
+            return False
+        if any(marker in text for marker in ("$", "\\", "\\mathbf", "\\sigma", "\\Gamma", "\\lambda")):
+            return True
+        if re.search(r"\b[A-Za-z]+_[A-Za-z0-9]+\b", text):
+            return True
+        return False
+
+    def _question_context_metrics(self, question, context_text):
+        if not question or not context_text:
+            return 0, 0.0
+        overlap = len(self._token_set(question) & self._token_set(context_text))
+        try:
+            similarity = self._cosine(
+                self._embed(question),
+                self._embed(context_text),
+            )
+        except Exception:
+            similarity = 0.0
+        return overlap, similarity
+
+    def _question_snippet(self, text, max_words=10):
+        clean = " ".join(str(text or "").split())
+        clean = re.sub(r"^[\"'`\s]+|[\"'`\s]+$", "", clean)
+        if not clean:
+            return "the proposed mechanism"
+        words = clean.split()
+        if len(words) > max_words:
+            clean = " ".join(words[:max_words]).rstrip(",;:.") + "..."
+        return clean
+
+    def _clean_generated_text(self, text):
+        cleaned = str(text or "")
+        cleaned = cleaned.replace("→", " maps to ")
+        cleaned = cleaned.replace("↔", " corresponds to ")
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
+        cleaned = re.sub(r"\$+", " ", cleaned)
+        cleaned = re.sub(r"\\[A-Za-z]+(?:\{[^{}]*\})*", " ", cleaned)
+        cleaned = cleaned.replace("\\", " ")
+        cleaned = re.sub(r"[_^{}]", " ", cleaned)
+        return " ".join(cleaned.split())
+
+    def _fallback_grounded_question(self, from_node, to_node, narration):
+        mission = self._mission_text()
+        source = self._question_snippet(from_node)
+        target = self._question_snippet(to_node)
+        relation_text = " ".join(str(narration or "").lower().split())
+        if any(token in relation_text for token in ["contradict", "conflict", "incompatible", "versus"]):
+            return f"Which observation would distinguish '{source}' from '{target}'?"
+        if mission:
+            mission_snippet = self._question_snippet(mission, max_words=12)
+            return (
+                "Which experiment or dataset would show whether "
+                f"'{target}' improves our answer to '{mission_snippet}'?"
+            )
+        if narration:
+            narration_snippet = self._question_snippet(narration, max_words=12)
+            return (
+                "What direct measurement would test the mechanism linking "
+                f"'{source}' to '{target}' around '{narration_snippet}'?"
+            )
+        return f"What experiment would test whether '{source}' changes '{target}'?"
+
+    def _mission_alignment_metrics(self, node_text, narration):
+        mission = self._mission_text()
+        if not mission:
+            return 0, 0.0
+        candidate = " ".join(filter(None, [str(node_text or ""), str(narration or "")]))
+        if not candidate.strip():
+            return 0, 0.0
+        return self._question_context_metrics(candidate, mission)
+
+    def _normalize_question(self, question, from_node, to_node, narration):
+        question = " ".join(str(question or "").split()).strip()
+        if not question:
+            return ""
+        if not question.endswith("?"):
+            question = question.rstrip(".") + "?"
+
+        context_text = " ".join(filter(None, [
+            self._mission_text(),
+            str(from_node or ""),
+            str(to_node or ""),
+            str(narration or ""),
+        ]))
+        overlap, similarity = self._question_context_metrics(question, context_text)
+        word_count = len(question.split())
+        if (
+            word_count > MAX_DREAM_QUESTION_WORDS or
+            self._question_has_symbolic_overreach(question) or
+            overlap < QUESTION_CONTEXT_TOKEN_OVERLAP_MIN or
+            similarity < QUESTION_CONTEXT_SIM_MIN
+        ):
+            return self._fallback_grounded_question(from_node, to_node, narration)
+        return question
+
     def _validate_insight_depth(self, from_node, to_node, narration, claimed_depth):
         if not claimed_depth or claimed_depth == "surface":
             return claimed_depth, narration
@@ -507,7 +776,7 @@ class Dreamer:
                 narration=narration,
                 claimed_depth=claimed_depth
             ), temperature=0.0)
-            validation = require_json(raw, default={})
+            validation = self._json_object(raw, default={})
             depth = validation.get("depth", "surface")
             reason = str(validation.get("reason", "")).lower()
             mapping_flag = validation.get("has_explicit_mapping", False)
@@ -544,7 +813,7 @@ class Dreamer:
                 claimed_depth=depth,
                 mission=mission,
             ), temperature=0.0)
-            refined = require_json(raw_refinement, default={})
+            refined = self._json_object(raw_refinement, default={})
             refined_depth = refined.get("depth", depth)
             refined_narration = str(refined.get("narration", narration)).strip() or narration
             mapping_pairs = refined.get("mapping_pairs", [])
@@ -733,7 +1002,7 @@ class Dreamer:
                 current_node=node_data['statement'], question=item.text
             ), temperature=0.1)
             try:
-                result = require_json(raw, default={})
+                result = self._json_object(raw, default={})
                 match  = result.get('match', 'none')
                 expl   = result.get('explanation', '')
                 if match in ['partial', 'strong']:
@@ -750,14 +1019,20 @@ class Dreamer:
         mission = self.brain.get_mission()
         if not mission:
             return False, "", 0.0
+        overlap, similarity = self._mission_alignment_metrics(
+            node_data.get('statement', ''),
+            narration,
+        )
+        if overlap < MISSION_ADVANCE_TOKEN_OVERLAP_MIN or similarity < MISSION_ADVANCE_SIM_MIN:
+            return False, "", 0.0
         raw = self._llm(MISSION_ADVANCE_PROMPT.format(
             mission=mission['question'],
             node=node_data['statement'],
             narration=narration), temperature=0.1)
         try:
-            result = require_json(raw, default={})
-            strength = float(result.get('strength', 0.0))
-            is_adv = result.get('advances', False) and strength > 0.5
+            result = self._json_object(raw, default={})
+            strength = max(0.0, min(1.0, float(result.get('strength', 0.0))))
+            is_adv = bool(result.get('advances', False)) and strength >= 0.7
             return is_adv, result.get('explanation', ''), strength
         except (json.JSONDecodeError, ValueError):
             pass
@@ -799,7 +1074,12 @@ class Dreamer:
             return node_id, 0
         lines  = raw.strip().split('\n')
         q_line = next((l for l in lines if l.startswith('Q:')), "")
-        followup = q_line[2:].strip() if q_line else ""
+        followup = self._normalize_question(
+            q_line[2:].strip() if q_line else "",
+            node_data.get('statement', ''),
+            explanation,
+            explanation,
+        )
         self._add_question(followup, questions, q_embeddings)
 
         current_id, current_data = node_id, node_data
@@ -944,6 +1224,12 @@ class Dreamer:
                 edge_narration, next_node['statement']), temperature=min(0.45, temperature))
             narration, question, is_insight, insight_depth = \
                 self._parse_narration(raw)
+            question = self._normalize_question(
+                question,
+                source_node.get('statement', ''),
+                next_node.get('statement', ''),
+                narration,
+            )
             raw_insight_depth = insight_depth
             if is_insight and insight_depth in ["structural", "isomorphism"]:
                 insight_depth, narration = self._validate_insight_depth(
@@ -1064,10 +1350,6 @@ class Dreamer:
                     "question": matched_q, "grade": match_grade,
                     "explanation": match_explanation
                 })
-                if self.research_agenda:
-                    self.research_agenda.record_answer(
-                        matched_q, next_id, match_explanation,
-                        grade=match_grade)
 
             if mission_advance:
                 self.brain.link_to_mission(
@@ -1078,9 +1360,6 @@ class Dreamer:
                     "explanation": mission_explanation,
                     "strength": mission_strength
                 })
-                if self.research_agenda:
-                    self.research_agenda.record_mission_advance(
-                        next_id, mission_explanation, mission_strength)
 
             ds = DreamStep(
                 step=step, from_id=source_id, to_id=next_id,
@@ -1200,3 +1479,384 @@ class Dreamer:
             print("── Transitional cycle complete — now FOCUSED ──")
 
         return log
+
+    # ── Hypothesis Generation Engine ─────────────────────────────────────────
+    #
+    # Unlike dream() which narrates random walks over existing edges,
+    # hypothesize() is GENERATIVE — it proposes what doesn't exist yet.
+    # It uses the LLM's prior knowledge + recently ingested claims to
+    # produce novel, testable hypotheses ("shower thoughts").
+    #
+    # The full Critic is bypassed. Instead, a lightweight single-shot
+    # plausibility gate filters out physically impossible proposals.
+    # The Critic only engages later, when evidence arrives and the
+    # hypothesis is being promoted from SPECULATIVE to WORKING.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _HYPOTHESIS_GENERATION_PROMPT = """You are a scientist who just read several new research findings. \
+Using your deep expert knowledge AND these specific findings, propose ONE novel, testable hypothesis.
+
+Recent findings:
+{seed_claims}
+
+{mission_block}
+
+Rules:
+- The hypothesis MUST propose a specific mechanism, not just a correlation.
+- It MUST be testable: state what evidence would confirm or refute it.
+- Stay within the entities, interactions, scales, and constraints present in the supplied findings unless the supplied findings explicitly justify a bridge.
+- In mission-driven mode, prefer the most conservative mechanistic extrapolation that still makes a new testable prediction.
+- Do NOT invent a new force, coupling, field, geometric effect, extra sector, or measurement target unless it is already motivated by the supplied findings.
+- Do NOT use LaTeX or symbolic notation. Spell quantities out in plain scientific prose.
+- State the hypothesis in 2-3 precise sentences.
+- Do NOT restate the seed findings. Propose something NEW that goes beyond them.
+- Use formal scientific prose. No first person.
+
+Respond with ONLY a JSON object:
+{{
+  "hypothesis": "the hypothesis statement (2-3 sentences)",
+  "mechanism": "the proposed mechanism in 1-2 sentences",
+  "testable_by": "what search query or experiment would test this (1 sentence)",
+  "confidence": 0.3
+}}"""
+
+    _PLAUSIBILITY_CHECK_PROMPT = """Is this hypothesis scientifically plausible? \
+A plausible hypothesis does not violate known physical laws or established scientific consensus. \
+It may be unproven or speculative, but it must not be provably impossible.
+
+Hypothesis: "{hypothesis}"
+
+Respond with ONLY a JSON object:
+{{"plausible": true or false, "reason": "one sentence"}}"""
+
+    _HYPOTHESIS_GROUNDING_PROMPT = """You are checking whether a proposed hypothesis stays grounded in supplied evidence.
+
+Seed findings:
+{seed_claims}
+
+Mission:
+{mission_block}
+
+Candidate hypothesis:
+{hypothesis}
+
+Candidate mechanism:
+{mechanism}
+
+Testable by:
+{testable_by}
+
+Grounded means:
+- It extrapolates one mechanistic step from the supplied entities, constraints, or observables.
+- It does not invent a new interaction, sector, geometry, or observable that the seed findings do not motivate.
+- Its proposed test follows from the stated mechanism.
+
+Respond ONLY with JSON:
+{{
+  "grounded": true or false,
+  "reason": "one sentence"
+}}"""
+
+    def __init_hypothesis_tracking(self):
+        """Lazily initialize hypothesis tracking state."""
+        if not hasattr(self, '_hypothesis_outcomes'):
+            self._hypothesis_outcomes: dict[str, list[str]] = {}
+
+    def record_hypothesis_outcome(self, cluster: str, outcome: str):
+        """
+        Record the outcome of a hypothesis for feedback learning.
+
+        Called by the Conductor when a hypothesis is resolved.
+        Tracks per-cluster success rates to modulate future creativity.
+
+        Args:
+            cluster: The cluster label of the hypothesis seed nodes.
+            outcome: One of "confirmed", "contradicted", "lacks_evidence".
+        """
+        self.__init_hypothesis_tracking()
+        self._hypothesis_outcomes.setdefault(cluster, []).append(outcome)
+
+    def _cluster_success_rate(self, cluster: str) -> float:
+        """
+        Returns the fraction of hypotheses from this cluster that were confirmed.
+
+        Returns 0.5 (neutral prior) when no outcomes have been recorded yet.
+        """
+        self.__init_hypothesis_tracking()
+        outcomes = self._hypothesis_outcomes.get(cluster, [])
+        if not outcomes:
+            return 0.5  # neutral prior
+        confirmed = sum(1 for o in outcomes if o == "confirmed")
+        return confirmed / len(outcomes)
+
+    def _select_hypothesis_seeds(
+        self,
+        seed_node_ids: list[str],
+        max_seeds: int = 3,
+        allow_cross_cluster: bool = False,
+    ) -> list[tuple[str, dict]]:
+        """
+        Select the most generative seed nodes for hypothesis generation.
+
+        Ranks by importance * (1 + surprise), then enforces cluster diversity:
+        if all top seeds are from the same cluster, force-includes one node
+        from a different cluster to enable cross-domain hypotheses.
+
+        Returns list of (node_id, node_data) tuples.
+        """
+        # Gather node data and sort by importance
+        candidates = []
+        for nid in seed_node_ids:
+            data = self.brain.get_node(nid)
+            if not data:
+                continue
+            # Skip non-claim nodes (e.g., SOURCE nodes)
+            if data.get('node_type') in (NodeType.SOURCE.value, NodeType.MISSION.value):
+                continue
+            importance = float(data.get('importance', 0.5))
+            candidates.append((importance, nid, data))
+
+        if not candidates:
+            return []
+
+        # Sort by importance descending
+        candidates.sort(reverse=True)
+        selected = [(nid, data) for _, nid, data in candidates[:max_seeds]]
+
+        # ── Cluster diversity enforcement ──
+        # If all selected seeds are from the same cluster, force-include
+        # one high-importance node from a different cluster.
+        if allow_cross_cluster and len(selected) >= 2:
+            clusters = {data.get('cluster', 'unclustered') for _, data in selected}
+            if len(clusters) == 1:
+                selected_cluster = clusters.pop()
+                # Find a high-importance node from a different cluster
+                all_nodes = self.brain.all_nodes()
+                cross_candidates = [
+                    (float(d.get('importance', 0.5)), nid, d)
+                    for nid, d in all_nodes
+                    if d.get('cluster', 'unclustered') != selected_cluster
+                    and d.get('cluster', 'unclustered') != 'unclustered'
+                    and d.get('node_type') not in (
+                        NodeType.SOURCE.value, NodeType.MISSION.value,
+                    )
+                    and nid not in seed_node_ids
+                ]
+                if cross_candidates:
+                    cross_candidates.sort(reverse=True)
+                    _, cross_nid, cross_data = cross_candidates[0]
+                    # Replace the least important selected seed
+                    selected[-1] = (cross_nid, cross_data)
+                    print(f"    ⇌ Cross-cluster seed injected from "
+                          f"[{cross_data.get('cluster', '?')}]")
+
+        return selected
+
+    def hypothesize(
+        self,
+        seed_node_ids: list[str],
+        mode: str = "free",
+        max_hypotheses: int = 3,
+    ) -> list[dict]:
+        """
+        Generate wild hypotheses seeded by specific claim nodes.
+
+        This is the 'shower thought' engine. It takes recently ingested
+        claims and prompts the LLM to use its prior knowledge to propose
+        novel, testable mechanisms.
+
+        Unlike dream(), this method is GENERATIVE — it proposes what
+        doesn't exist in the graph yet. Wild hypotheses bypass the full
+        Critic and go through a lightweight plausibility gate instead.
+
+        Args:
+            seed_node_ids: Node IDs of recently ingested claims to seed from.
+            mode: "free" (unconstrained) or "mission_driven" (mission-oriented).
+            max_hypotheses: Maximum number of hypotheses to generate.
+
+        Returns:
+            List of dicts: {statement, mechanism, testable_by, seed_ids, node_id}
+        """
+        self.__init_hypothesis_tracking()
+
+        # ── Throttle check ──
+        if not self.brain.can_spawn_hypothesis():
+            active = self.brain.count_active_hypotheses()
+            print(f"  ⊘ Hypothesis throttle: {active}/{self.brain.MAX_ACTIVE_HYPOTHESES}"
+                  f" active — skipping generation")
+            return []
+
+        if not seed_node_ids:
+            print("  ⊘ No seed nodes for hypothesis generation")
+            return []
+
+        # ── Seed selection ──
+        seeds = self._select_hypothesis_seeds(
+            seed_node_ids,
+            max_seeds=max_hypotheses,
+            allow_cross_cluster=(mode != "mission_driven"),
+        )
+        if not seeds:
+            print("  ⊘ No valid seed nodes after filtering")
+            return []
+
+        print(f"\n── Dreamer: hypothesize [{mode}] — {len(seeds)} seeds ──")
+
+        # ── Mission block ──
+        mission_block = ""
+        if mode == "mission_driven":
+            mission = self._mission_text()
+            if mission:
+                mission_block = (
+                    f"Your central research question: \"{mission}\"\n"
+                    f"The hypothesis should help answer this question."
+                )
+
+        results = []
+        remaining_budget = self.brain.MAX_ACTIVE_HYPOTHESES - self.brain.count_active_hypotheses()
+
+        for seed_nid, seed_data in seeds:
+            if len(results) >= max_hypotheses or remaining_budget <= 0:
+                break
+
+            seed_cluster = seed_data.get('cluster', 'unclustered')
+            seed_statement = seed_data.get('statement', '')
+
+            # Gather context from seed + its neighbors
+            seed_claims_lines = [f"- {seed_statement}"]
+            for neighbor_id in list(self.brain.graph.predecessors(seed_nid))[:3]:
+                neighbor = self.brain.get_node(neighbor_id)
+                if neighbor and neighbor.get('node_type') != NodeType.SOURCE.value:
+                    seed_claims_lines.append(f"- {neighbor.get('statement', '')}")
+            for neighbor_id in list(self.brain.graph.successors(seed_nid))[:3]:
+                neighbor = self.brain.get_node(neighbor_id)
+                if neighbor and neighbor.get('node_type') != NodeType.SOURCE.value:
+                    seed_claims_lines.append(f"- {neighbor.get('statement', '')}")
+
+            seed_claims_text = "\n".join(seed_claims_lines[:6])
+
+            # ── Modulate temperature by cluster success rate ──
+            success_rate = self._cluster_success_rate(seed_cluster)
+            temperature = 0.35 + (0.10 * success_rate)
+            if mode == "mission_driven":
+                temperature = max(0.22, temperature - 0.08)
+
+            # ── Generate hypothesis ──
+            raw = self._llm(
+                self._HYPOTHESIS_GENERATION_PROMPT.format(
+                    seed_claims=seed_claims_text,
+                    mission_block=mission_block,
+                ),
+                temperature=temperature,
+            )
+            hyp_data = self._json_object(raw, default={})
+
+            hypothesis_text = self._clean_generated_text(hyp_data.get('hypothesis', ''))
+            mechanism = self._clean_generated_text(hyp_data.get('mechanism', ''))
+            testable_by = self._clean_generated_text(hyp_data.get('testable_by', ''))
+
+            if not hypothesis_text or len(hypothesis_text) < 20:
+                print(f"    ✗ Empty/short hypothesis for seed [{seed_nid[:8]}]")
+                continue
+
+            print(f"    💭 Candidate: {hypothesis_text[:80]}...")
+
+            candidate_payload = " ".join(filter(None, [hypothesis_text, mechanism, testable_by]))
+            overlap, similarity = self._question_context_metrics(
+                candidate_payload,
+                " ".join(filter(None, [seed_claims_text, mission_block])),
+            )
+            if (
+                overlap < HYPOTHESIS_CONTEXT_TOKEN_OVERLAP_MIN or
+                similarity < HYPOTHESIS_CONTEXT_SIM_MIN
+            ):
+                print("    ✗ Rejected: candidate drifted away from supplied findings")
+                continue
+
+            # ── Plausibility gate (lightweight — 1 LLM call, NOT full Critic) ──
+            plaus_raw = self._llm(
+                self._PLAUSIBILITY_CHECK_PROMPT.format(hypothesis=hypothesis_text),
+                temperature=0.1,
+            )
+            plaus = self._json_object(plaus_raw, default={"plausible": True})
+            is_plausible = plaus.get("plausible", True)
+            if isinstance(is_plausible, str):
+                is_plausible = is_plausible.strip().lower() in {"true", "1", "yes"}
+
+            if not is_plausible:
+                reason = plaus.get("reason", "unknown")
+                print(f"    ✗ Implausible: {reason}")
+                continue
+
+            grounding_raw = self._llm(
+                self._HYPOTHESIS_GROUNDING_PROMPT.format(
+                    seed_claims=seed_claims_text,
+                    mission_block=mission_block or "none",
+                    hypothesis=hypothesis_text,
+                    mechanism=mechanism or "none",
+                    testable_by=testable_by or "none",
+                ),
+                temperature=0.1,
+            )
+            grounding = self._json_object(grounding_raw, default={"grounded": True})
+            grounded = grounding.get("grounded", True)
+            if isinstance(grounded, str):
+                grounded = grounded.strip().lower() in {"true", "1", "yes"}
+            if not grounded:
+                reason = grounding.get("reason", "candidate introduced unsupported machinery")
+                print(f"    ✗ Ungrounded: {reason}")
+                continue
+
+            accepted, reviewed_claim, review_reason = self._critic_review_hypothesis(
+                hypothesis_text,
+                mechanism,
+                seed_claims_text,
+                expected_status=ArtifactStatus.OPEN.value,
+            )
+            if not accepted:
+                print(f"    ✗ Deferred by critic: {review_reason or 'insufficient support'}")
+                continue
+            hypothesis_text = reviewed_claim or hypothesis_text
+
+            # ── Create hypothesis node ──
+            hyp_node = Node(
+                statement=hypothesis_text,
+                node_type=NodeType.HYPOTHESIS,
+                cluster=seed_cluster,
+                status=NodeStatus.HYPOTHETICAL,
+                epistemic_status=ArtifactStatus.SPECULATIVE.value,
+                importance=float(seed_data.get('importance', 0.5)),
+                source_quality=0.3,  # dream-sourced
+                predicted_answer=mechanism,
+                testable_by=testable_by,
+                created_by="dreamer_hypothesis",
+            )
+            hyp_nid = self.brain.add_node(hyp_node)
+
+            # ── Create DERIVED_FROM edges to seed nodes ──
+            derived_edge = Edge(
+                type=EdgeType.DERIVED_FROM,
+                narration=f"Hypothesis derived from claim: {seed_statement[:100]}",
+                weight=0.6,
+                confidence=0.5,
+                source=EdgeSource.DREAM,
+                decay_exempt=True,
+            )
+            self.brain.add_edge(hyp_nid, seed_nid, derived_edge)
+
+            result = {
+                "statement": hypothesis_text,
+                "mechanism": mechanism,
+                "testable_by": testable_by,
+                "seed_ids": [seed_nid],
+                "node_id": hyp_nid,
+                "cluster": seed_cluster,
+                "temperature": temperature,
+            }
+            results.append(result)
+            remaining_budget -= 1
+            print(f"    ✓ Hypothesis created [{hyp_nid[:8]}] "
+                  f"(cluster={seed_cluster}, temp={temperature:.2f})")
+
+        print(f"── Dreamer: {len(results)} hypotheses generated ──\n")
+        return results

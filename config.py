@@ -38,6 +38,12 @@ class ModelConfig:
     CONVERSATION = "gemma4:latest"
     # Critic / System 2: adversarial evaluation, gating
     CRITIC       = "gemma4:latest"
+    # Structured notebook summaries and progress memos
+    NOTEBOOK     = "gemma4:latest"
+    # Conservative publication drafting
+    PUBLICATION  = "gemma4:latest"
+    # Strict verification / admissibility checks
+    VERIFIER     = "gemma4:latest"
 
 
 MODELS = ModelConfig()

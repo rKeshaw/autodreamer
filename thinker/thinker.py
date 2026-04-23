@@ -26,6 +26,7 @@ from graph.brain import (Brain, Node, Edge, EdgeType, EdgeSource,
 from llm_utils import llm_call, llm_json, llm_chat
 from embedding import embed as shared_embed
 from thinker.policy import CognitivePolicy
+from scientist_workspace import ArtifactStatus, ReasoningResult, ScientistWorkspace
 
 # ── Thinking patterns ─────────────────────────────────────────────────────────
 
@@ -122,6 +123,34 @@ Can you find a UNIFYING PRINCIPLE that:
 If you find one, state it precisely. If not, explain what's missing.
 """
 
+HYPOTHESIS_TESTING_PROMPT = """You are a scientist evaluating a hypothesis by decomposing it into testable components.
+
+HYPOTHESIS: {question}
+
+RELEVANT KNOWLEDGE:
+{context}
+
+Your task is to decompose this hypothesis into testable sub-claims and produce
+concrete search queries that would find evidence for or against each one.
+
+1. What are the 2-3 SPECIFIC CLAIMS embedded in this hypothesis?
+2. For each claim, what SEARCH QUERY (4-8 words) would find evidence for or against it?
+3. What would CONFIRMATION look like? What would REFUTATION look like?
+
+Respond with JSON:
+{{
+  "sub_claims": [
+    {{
+      "claim": "the specific sub-claim",
+      "search_query": "concise literature search query",
+      "confirmation_looks_like": "what evidence would confirm this",
+      "refutation_looks_like": "what evidence would refute this"
+    }}
+  ],
+  "overall_assessment": "one sentence: how promising is this hypothesis given current knowledge?"
+}}
+"""
+
 PICK_PATTERN_PROMPT = """You are selecting a reasoning strategy for a scientific question.
 
 QUESTION: {question}
@@ -132,6 +161,7 @@ Available strategies:
 - reductive: break into sub-questions (best for complex, multi-part problems)
 - experimental: design thought experiments (best for testable hypotheses)
 - integrative: find unifying principles (best when many related facts exist)
+- hypothesis_testing: decompose into testable sub-claims with search queries (best for wild hypotheses)
 
 Which strategy is BEST for this question? Respond with ONLY the strategy name.
 """
@@ -185,28 +215,66 @@ Respond EXACTLY in JSON:
 }}
 """
 
+REASONING_RESULT_PROMPT = """You are structuring the output of a scientist's reasoning session.
+
+QUESTION:
+{question}
+
+PATTERN:
+{pattern}
+
+SCIENTIST WORKSPACE:
+{workspace}
+
+REASONING:
+{reasoning}
+
+Return a JSON object with:
+{{
+  "grounded_claims": ["claims directly supported by grounded evidence already present in the workspace"],
+  "prior_claims": ["useful background-knowledge claims used in reasoning but not directly grounded by the workspace evidence"],
+  "hypotheses": ["speculative mechanisms or explanatory proposals"],
+  "open_questions": ["specific unresolved scientific questions"],
+  "next_actions": ["concrete next research or analysis actions"],
+  "summary_claim": "the single best current statement to store"
+}}
+
+Rules:
+- Put a claim in "grounded_claims" only if it is supported by the grounded evidence in the workspace.
+- Put background knowledge, intuition, or memory-based reasoning in "prior_claims".
+- Put speculative explanations in "hypotheses".
+- The "summary_claim" must be cautious and well-labeled. If it depends on prior knowledge or speculation, say so explicitly.
+- Keep each item to 1-2 sentences max.
+- Use [] for empty lists and "" for an empty summary.
+Respond ONLY with JSON.
+"""
+
 SUPPORTED_THINKING_PATTERNS = {
     "dialectical",
     "analogical",
     "reductive",
     "experimental",
     "integrative",
+    "hypothesis_testing",
 }
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class ThinkingLog:
-    question: str          = ""
-    pattern: str           = ""
-    node_type: str         = "question"
-    cluster: str           = "unclustered"
-    reasoning: str         = ""
-    insight: str           = ""
-    sub_questions: list    = field(default_factory=list)
-    node_id: str           = ""
-    started_at: float      = field(default_factory=time.time)
-    duration: float        = 0.0
+    question: str           = ""
+    pattern: str            = ""
+    node_type: str          = "question"
+    cluster: str            = "unclustered"
+    reasoning: str          = ""
+    insight: str            = ""
+    sub_questions: list     = field(default_factory=list)
+    workspace: dict         = field(default_factory=dict)
+    reasoning_result: dict  = field(default_factory=dict)
+    node_id: str            = ""
+    question_node_id: str   = ""    # ID of the hypothesis/question node being processed
+    started_at: float       = field(default_factory=time.time)
+    duration: float         = 0.0
 
     def to_dict(self):
         return self.__dict__
@@ -222,45 +290,50 @@ class Thinker:
         self.index    = embedding_index
         self.critic   = critic   # System 2 gating (optional)
         self.policy   = CognitivePolicy()
+        self._pattern_hint_cache: dict[str, str] = {}
 
-    def _build_context(self, question: str, max_nodes: int = 8) -> str:
-        """Build relevant context from the graph for a given question."""
-        lines = []
+    def _build_workspace(self, question: str) -> ScientistWorkspace:
+        return self.brain.build_workspace(
+            embedding_index=self.index,
+            query=question,
+        )
 
-        # From embedding index
-        if self.index and self.index.size > 0:
-            q_emb = shared_embed(question)
-            matches = self.index.query(q_emb, threshold=0.25, top_k=max_nodes)
-            for nid, score in matches:
-                node = self.brain.get_node(nid)
-                if node:
-                    ntype = node.get('node_type', 'concept')
-                    status = node.get('status', 'uncertain')
-                    lines.append(
-                        f"[{ntype}/{status}] {node['statement']}"
-                    )
+    def _build_context(self, question: str,
+                       workspace: ScientistWorkspace | None = None) -> str:
+        """Build relevant context from the current scientist workspace."""
+        workspace = workspace or self._build_workspace(question)
+        context = workspace.to_prompt_context()
+        return context if context.strip() else "No relevant knowledge found."
 
-        # Working memory items (always included)
-        for nid, data in self.brain.get_working_memory():
-            line = f"[FOCUS/{data.get('node_type','concept')}] {data['statement']}"
-            if line not in lines:
-                lines.append(line)
+    def _pick_question(self) -> tuple[str, str, str]:
+        """Pick the best question to think about from the agenda/graph.
 
-        # Mission context
-        mission = self.brain.get_mission()
-        if mission:
-            lines.insert(0, f"[MISSION] {mission['question']}")
+        Returns:
+            Tuple of (question_text, question_node_id, preferred_pattern).
+            question_node_id is empty string if the question doesn't come from a node.
+            preferred_pattern is empty string unless a specific pattern is warranted.
+        """
+        # ── HIGHEST PRIORITY: untested Dreamer hypotheses ──
+        # These are wild hypotheses awaiting decomposition into search queries.
+        hyp_nodes = self.brain.nodes_by_type(NodeType.HYPOTHESIS)
+        untested = [
+            (nid, data) for nid, data in hyp_nodes
+            if data.get('status') == NodeStatus.HYPOTHETICAL.value
+            and data.get('created_by') == 'dreamer_hypothesis'
+        ]
+        if untested:
+            # Sort by importance (higher = more mission-relevant)
+            untested.sort(key=lambda x: x[1].get('importance', 0), reverse=True)
+            nid, data = untested[0]
+            return data['statement'], nid, 'hypothesis_testing'
 
-        return "\n\n".join(lines) if lines else "No relevant knowledge found."
-
-    def _pick_question(self) -> str:
-        """Pick the best question to think about from the agenda/graph."""
         # Priority: working memory hypotheses > agenda questions > high-importance gaps
         for nid, data in self.brain.get_working_memory():
             if data.get('node_type') in [NodeType.HYPOTHESIS.value,
                                           NodeType.QUESTION.value,
-                                          NodeType.GAP.value]:
-                return data['statement']
+                                          NodeType.GAP.value,
+                                          NodeType.TASK.value]:
+                return data['statement'], nid, ''
 
         # From observer agenda
         if self.observer and hasattr(self.observer, 'agenda'):
@@ -271,25 +344,26 @@ class Thinker:
             if open_items:
                 # Pick highest priority
                 best = max(open_items, key=lambda x: x.priority)
-                return best.text
+                return best.text, getattr(best, 'node_id', ''), ''
 
         # From graph — highest importance unresolved question
         questions = self.brain.nodes_by_type(NodeType.QUESTION)
         gaps      = self.brain.nodes_by_type(NodeType.GAP)
         hyps      = self.brain.nodes_by_type(NodeType.HYPOTHESIS)
+        tasks     = self.brain.nodes_by_type(NodeType.TASK)
 
-        candidates = questions + gaps + hyps
+        candidates = questions + gaps + hyps + tasks
         if candidates:
             best = max(candidates,
                        key=lambda x: x[1].get('importance', 0.5))
-            return best[1]['statement']
+            return best[1]['statement'], best[0], ''
 
         # Fallback: think about the mission
         mission = self.brain.get_mission()
         if mission:
-            return mission['question']
+            return mission['question'], mission.get('id', ''), ''
 
-        return "What is the most important open question in our knowledge?"
+        return "What is the most important open question in our knowledge?", '', ''
 
     def _pick_pattern(self, question: str) -> tuple[str, str, str]:
         """Choose a pattern using question semantics plus procedural memory."""
@@ -322,75 +396,27 @@ class Thinker:
             "first_principles": "reductive",
             "first_principle": "reductive",
             "synthesis": "integrative",
+            "hypothesis_test": "hypothesis_testing",
         }
         if text in alias_map:
             text = alias_map[text]
         return text if text in SUPPORTED_THINKING_PATTERNS else ""
 
-    def _heuristic_pattern_hint(self, question: str) -> str:
-        q = (question or "").lower()
-        if any(phrase in q for phrase in (
-            "sub-question",
-            "sub question",
-            "decompose",
-            "break down",
-            "simpler unknown",
-            "tractable sub",
-            "sub-problem",
-            "sub problem",
-        )):
-            return "reductive"
-        if any(phrase in q for phrase in (
-            "unifying principle",
-            "what explains why",
-            "why all",
-            "common principle",
-            "unify",
-        )):
-            return "integrative"
-        if any(phrase in q for phrase in (
-            "what observable",
-            "what would we expect",
-            "what would distinguish",
-            "if ",
-            "prediction",
-            "consequence",
-            "test this",
-        )):
-            return "experimental"
-        if any(phrase in q for phrase in (
-            "supports versus",
-            "supports and",
-            "argues against",
-            "evidence for and against",
-            "weighed for and against",
-            "does the evidence cut",
-            "defensible, or",
-            "versus weakens",
-        )):
-            return "dialectical"
-        if any(phrase in q for phrase in (
-            "analogy",
-            "analogous",
-            "parallel",
-            "transfer",
-            "different domain",
-            "compare to",
-            "offer an analogy",
-        )):
-            return "analogical"
-        return ""
-
     def _semantic_pattern_hint(self, question: str) -> str:
-        heuristic = self._heuristic_pattern_hint(question)
-        if heuristic:
-            return heuristic
+        q_key = self._normalize_text(question)
+        if q_key in self._pattern_hint_cache:
+            return self._pattern_hint_cache[q_key]
+
         raw = llm_call(
             PICK_PATTERN_PROMPT.format(question=question),
             temperature=0.1,
             role="precise"
         )
-        return self._normalize_pattern_name(raw)
+        pattern = self._normalize_pattern_name(raw)
+        if not pattern:
+            pattern = "dialectical"
+        self._pattern_hint_cache[q_key] = pattern
+        return pattern
 
     def _mission_text(self) -> str:
         mission = self.brain.get_mission()
@@ -444,30 +470,6 @@ class Thinker:
             return 0.0
         return len(main_tokens & sub_tokens) / max(len(sub_tokens), 1)
 
-    def _focus_cue_bonus(self, question: str) -> float:
-        q = self._normalize_text(question)
-        bonus = 0.0
-        cue_weights = {
-            "mechanism": 1.2,
-            "metric": 1.2,
-            "quantif": 1.0,
-            "measure": 1.0,
-            "distinguish": 1.0,
-            "compare": 0.8,
-            "boundary": 0.8,
-            "condition": 0.8,
-            "transition": 1.0,
-            "balance": 0.8,
-            "mapping": 0.8,
-            "framework": 0.6,
-            "rate": 0.6,
-            "dynamics": 0.8,
-        }
-        for cue, weight in cue_weights.items():
-            if cue in q:
-                bonus += weight
-        return bonus
-
     def _question_like(self, text: str) -> bool:
         stripped = (text or "").strip()
         if not stripped:
@@ -492,8 +494,16 @@ class Thinker:
                 return q_text
             leverage, tractability = self._score_sub_question(sq)
             overlap = self._question_overlap_score(main_question, q_text)
-            cue_bonus = self._focus_cue_bonus(q_text)
-            score = (leverage * 3.0) + (tractability * 0.8) + (overlap * 4.0) + cue_bonus
+            recommendation_overlap = self._question_overlap_score(
+                recommended_focus or main_question,
+                q_text,
+            )
+            score = (
+                (leverage * 1.6) +
+                (tractability * 1.2) +
+                (overlap * 2.2) +
+                (recommendation_overlap * 2.0)
+            )
             candidates.append((score, len(q_text), q_text))
 
         if not candidates:
@@ -581,6 +591,129 @@ class Thinker:
             return self._fallback_next_round(anchor_question, previous_log)
         return next_question, preferred_pattern
 
+    def _reasoning_result_from_text(self, question: str, pattern: str,
+                                    reasoning: str,
+                                    workspace: ScientistWorkspace) -> ReasoningResult:
+        result = llm_json(
+            REASONING_RESULT_PROMPT.format(
+                question=question,
+                pattern=pattern,
+                workspace=workspace.to_prompt_context(),
+                reasoning=reasoning,
+            ),
+            temperature=0.2,
+            default={},
+        )
+        parsed = ReasoningResult.from_dict(result if isinstance(result, dict) else {})
+        if not parsed.summary_claim:
+            parsed.summary_claim = llm_call(
+                THINKING_SUMMARY_PROMPT.format(reasoning=reasoning),
+                temperature=0.2,
+                role="precise"
+            ).strip()
+        return parsed
+
+    def _reasoning_result_from_reductive(self, result: dict,
+                                         focus_question: str) -> ReasoningResult:
+        sub_questions = []
+        for item in result.get("sub_questions", [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            question = (item.get("question") or "").strip()
+            if question:
+                sub_questions.append(question)
+
+        next_actions = []
+        if focus_question:
+            next_actions.append(f"Investigate: {focus_question}")
+        recommended_focus = (result.get("recommended_focus") or "").strip()
+        if recommended_focus and recommended_focus not in next_actions:
+            next_actions.append(recommended_focus)
+
+        summary = self._format_focus_insight(focus_question, recommended_focus)
+        return ReasoningResult(
+            open_questions=sub_questions,
+            next_actions=next_actions[:3],
+            summary_claim=summary,
+        )
+
+    def _source_payload_from_workspace(self, workspace: ScientistWorkspace) -> tuple[list[str], list[str]]:
+        source_ids = []
+        source_refs = []
+        for node in workspace.grounded_evidence:
+            for source_id in node.source_ids:
+                if source_id not in source_ids:
+                    source_ids.append(source_id)
+            for ref in node.source_refs:
+                if ref not in source_refs:
+                    source_refs.append(ref)
+        return source_ids, source_refs
+
+    def _classify_summary_output(self, result: ReasoningResult) -> tuple[NodeType, str]:
+        if result.hypotheses:
+            return NodeType.HYPOTHESIS, ArtifactStatus.SPECULATIVE.value
+        if result.grounded_claims and not result.prior_claims:
+            return NodeType.ANSWER, ArtifactStatus.GROUNDED.value
+        if result.prior_claims and not result.grounded_claims:
+            return NodeType.HYPOTHESIS, ArtifactStatus.PRIOR.value
+        return NodeType.SYNTHESIS, ArtifactStatus.OPEN.value
+
+    def _add_structured_node(self, statement: str, node_type: NodeType,
+                             epistemic_status: str, importance: float = 0.65,
+                             cluster: str = "thinking",
+                             source_ids: list[str] | None = None,
+                             source_refs: list[str] | None = None,
+                             created_by: str = "thinker") -> str:
+        node = Node(
+            statement=statement,
+            node_type=node_type,
+            cluster=cluster,
+            status=NodeStatus.UNCERTAIN,
+            epistemic_status=epistemic_status,
+            importance=importance,
+            source_quality=importance,
+            source_ids=list(source_ids or []),
+            source_refs=list(source_refs or []),
+            created_by=created_by,
+        )
+        nid = self.brain.add_node(node)
+        if self.index:
+            self.index.add(nid, shared_embed(statement))
+        return nid
+
+    def _persist_reasoning_result(self, result: ReasoningResult,
+                                  workspace: ScientistWorkspace):
+        for question in result.open_questions[:3]:
+            nid = self._add_structured_node(
+                question,
+                NodeType.QUESTION,
+                ArtifactStatus.OPEN.value,
+                importance=0.62,
+            )
+            if self.observer and hasattr(self.observer, "add_to_agenda"):
+                self.observer.add_to_agenda(
+                    text=question,
+                    item_type="question",
+                    cycle=getattr(self.observer, "cycle_count", 0),
+                    node_id=nid,
+                )
+
+        for action in result.next_actions[:3]:
+            nid = self._add_structured_node(
+                action,
+                NodeType.TASK,
+                ArtifactStatus.OPEN.value,
+                importance=0.58,
+            )
+            if self.observer and hasattr(self.observer, "add_to_agenda"):
+                item = self.observer.add_to_agenda(
+                    text=action,
+                    item_type="task",
+                    cycle=getattr(self.observer, "cycle_count", 0),
+                    node_id=nid,
+                )
+                item.priority = max(item.priority, 0.6)
+
     def think(self, question: str = None, pattern: str = None,
               max_depth: int = 2) -> ThinkingLog:
         """
@@ -598,35 +731,92 @@ class Thinker:
         log = ThinkingLog()
 
         # Pick question
+        question_node_id = ''
+        preferred_pattern = ''
         if not question:
-            question = self._pick_question()
+            question, question_node_id, preferred_pattern = self._pick_question()
         log.question = question
+        log.question_node_id = question_node_id
         print(f"\n── Thinking: {question[:80]}... ──")
 
         # Pick pattern
         if not pattern:
-            log.node_type, log.cluster, pattern = self._pick_pattern(question)
+            if preferred_pattern and preferred_pattern in SUPPORTED_THINKING_PATTERNS:
+                # Use the pattern suggested by _pick_question (e.g., hypothesis_testing)
+                log.node_type, log.cluster, pattern = 'hypothesis', 'unclustered', preferred_pattern
+                # Try to get cluster from the node
+                if question_node_id:
+                    node_data = self.brain.get_node(question_node_id)
+                    if node_data:
+                        log.node_type = node_data.get('node_type', 'hypothesis')
+                        log.cluster = node_data.get('cluster', 'unclustered')
+            else:
+                log.node_type, log.cluster, pattern = self._pick_pattern(question)
         else:
             log.node_type, log.cluster = "question", "unclustered"
             
         log.pattern = pattern
         print(f"  Pattern: {pattern}")
 
-        # Build context
-        context = self._build_context(question)
+        # Build workspace-aware context
+        workspace = self._build_workspace(question)
+        log.workspace = workspace.to_dict()
+        context = self._build_context(question, workspace)
 
         # Run the appropriate reasoning pattern
         prompts = {
-            "dialectical":  DIALECTICAL_PROMPT,
-            "analogical":   ANALOGICAL_PROMPT,
-            "reductive":    REDUCTIVE_PROMPT,
-            "experimental": EXPERIMENTAL_PROMPT,
-            "integrative":  INTEGRATIVE_PROMPT,
+            "dialectical":       DIALECTICAL_PROMPT,
+            "analogical":        ANALOGICAL_PROMPT,
+            "reductive":         REDUCTIVE_PROMPT,
+            "experimental":      EXPERIMENTAL_PROMPT,
+            "integrative":       INTEGRATIVE_PROMPT,
+            "hypothesis_testing": HYPOTHESIS_TESTING_PROMPT,
         }
 
         prompt = prompts.get(pattern, DIALECTICAL_PROMPT)
 
-        if pattern == "reductive":
+        # ── Hypothesis testing: mark the hypothesis node as TESTING ──
+        if pattern == 'hypothesis_testing' and question_node_id:
+            self.brain.update_node(
+                question_node_id,
+                status=NodeStatus.TESTING.value,
+            )
+            print(f"  Hypothesis [{question_node_id[:8]}] → TESTING")
+
+        reasoning_result = ReasoningResult()
+
+        if pattern == "hypothesis_testing":
+            # Hypothesis testing returns structured JSON with search queries
+            result = llm_json(
+                prompt.format(question=question, context=context),
+                temperature=0.3,
+                default={"sub_claims": [], "overall_assessment": ""}
+            )
+            log.sub_questions = result.get("sub_claims", [])
+            log.reasoning = json.dumps(result, indent=2)
+
+            # Extract search queries as next_actions
+            search_queries = [
+                sc.get('search_query', '')
+                for sc in log.sub_questions
+                if sc.get('search_query')
+            ]
+            overall = result.get('overall_assessment', '')
+            reasoning_result = ReasoningResult(
+                hypotheses=[question],
+                open_questions=[sc.get('claim', '') for sc in log.sub_questions if sc.get('claim')],
+                next_actions=search_queries[:4],
+                summary_claim=overall or f"Hypothesis under test: {question[:100]}",
+            )
+            log.reasoning_result = reasoning_result.to_dict()
+            log.insight = overall
+
+            print(f"  Sub-claims: {len(log.sub_questions)}")
+            for sc in log.sub_questions[:4]:
+                print(f"    → {sc.get('claim', '')[:60]}")
+                print(f"      Search: {sc.get('search_query', '')}")
+
+        elif pattern == "reductive":
             # Reductive returns structured JSON
             result = llm_json(
                 prompt.format(question=question, context=context),
@@ -641,17 +831,12 @@ class Thinker:
                 q_text = sq.get("question", "")
                 if not q_text:
                     continue
-                node = Node(
-                    statement    = q_text,
-                    node_type    = NodeType.QUESTION,
-                    cluster      = "thinking",
-                    status       = NodeStatus.UNCERTAIN,
-                    importance   = 0.65,
-                    source_quality = 0.6
+                nid = self._add_structured_node(
+                    q_text,
+                    NodeType.QUESTION,
+                    ArtifactStatus.OPEN.value,
+                    importance=0.65,
                 )
-                nid = self.brain.add_node(node)
-                if self.index:
-                    self.index.add(nid, shared_embed(q_text))
 
                 # Add to agenda
                 if self.observer and hasattr(self.observer, 'add_to_agenda'):
@@ -675,8 +860,26 @@ class Thinker:
                 log.sub_questions,
                 focus,
             )
-            if focus_question or focus:
-                log.insight = self._format_focus_insight(focus_question, focus)
+            reasoning_result = self._reasoning_result_from_reductive(
+                result,
+                focus_question,
+            )
+
+            for action in reasoning_result.next_actions[:3]:
+                nid = self._add_structured_node(
+                    action,
+                    NodeType.TASK,
+                    ArtifactStatus.OPEN.value,
+                    importance=0.58,
+                )
+                if self.observer and hasattr(self.observer, "add_to_agenda"):
+                    item = self.observer.add_to_agenda(
+                        text=action,
+                        item_type="task",
+                        cycle=getattr(self.observer, "cycle_count", 0),
+                        node_id=nid,
+                    )
+                    item.priority = max(item.priority, 0.6)
         else:
             # Other patterns return free-form reasoning
             log.reasoning = llm_call(
@@ -684,25 +887,35 @@ class Thinker:
                 temperature=0.5,
                 role="reasoning"
             )
-
-            # Extract insight as a storable statement
-            log.insight = llm_call(
-                THINKING_SUMMARY_PROMPT.format(reasoning=log.reasoning),
-                temperature=0.2,
-                role="precise"
+            reasoning_result = self._reasoning_result_from_text(
+                question,
+                pattern,
+                log.reasoning,
+                workspace,
             )
+            self._persist_reasoning_result(reasoning_result, workspace)
+
+        log.reasoning_result = reasoning_result.to_dict()
+        log.insight = reasoning_result.summary_claim
 
         # ── System 2 gating ──
         # Route insight through Critic before graph insertion
         if log.insight and len(log.insight) > 15:
+            summary_node_type, summary_status = self._classify_summary_output(
+                reasoning_result
+            )
+            source_ids, source_refs = self._source_payload_from_workspace(workspace)
             if self.critic:
                 from critic.critic import CandidateThought, Verdict
                 candidate = CandidateThought(
                     claim         = log.insight,
                     source_module = "thinker",
-                    proposed_type = "synthesis",
+                    proposed_type = summary_node_type.value,
                     importance    = 0.7,
                     context       = log.reasoning,
+                    grounded_evidence=source_refs,
+                    source_ids    = source_ids,
+                    expected_status=summary_status,
                 )
                 critic_log = self.critic.evaluate_with_refinement(candidate)
                 final_claim = critic_log.final_claim or candidate.claim
@@ -712,18 +925,15 @@ class Thinker:
                     # Use critic-assigned confidence instead of default
                     confidence  = critic_log.confidence
                     log.insight = final_claim
-                    node = Node(
-                        statement      = final_claim,
-                        node_type      = NodeType.SYNTHESIS,
-                        cluster        = "thinking",
-                        status         = NodeStatus.UNCERTAIN,
-                        importance     = confidence,
-                        source_quality = confidence
+                    nid = self._add_structured_node(
+                        final_claim,
+                        summary_node_type,
+                        summary_status,
+                        importance=confidence,
+                        source_ids=source_ids,
+                        source_refs=source_refs,
                     )
-                    nid = self.brain.add_node(node)
                     log.node_id = nid
-                    if self.index:
-                        self.index.add(nid, shared_embed(final_claim))
                     self.brain.focus_on(nid)
                     print(f"  ✓ Insight accepted (conf={confidence:.2f}): "
                           f"{final_claim[:80]}...")
@@ -747,6 +957,9 @@ class Thinker:
                         node_b_id=candidate.node_b_id,
                         crosses_domains=candidate.crosses_domains,
                         contradicts_existing=candidate.contradicts_existing,
+                        grounded_evidence=list(candidate.grounded_evidence),
+                        source_ids=list(candidate.source_ids),
+                        expected_status=candidate.expected_status,
                     )
                     self.critic.route_deferred(deferred_candidate)
                     log.insight = ""  # clear — not in graph yet
@@ -762,18 +975,15 @@ class Thinker:
             else:
                 self.policy.update(log.node_type, log.cluster, log.pattern, 0.5, self.brain.dopamine)
                 # No critic — original behavior (direct insertion)
-                node = Node(
-                    statement      = log.insight,
-                    node_type      = NodeType.SYNTHESIS,
-                    cluster        = "thinking",
-                    status         = NodeStatus.UNCERTAIN,
-                    importance     = 0.7,
-                    source_quality = 0.6
+                nid = self._add_structured_node(
+                    log.insight,
+                    summary_node_type,
+                    summary_status,
+                    importance=0.7,
+                    source_ids=source_ids,
+                    source_refs=source_refs,
                 )
-                nid = self.brain.add_node(node)
                 log.node_id = nid
-                if self.index:
-                    self.index.add(nid, shared_embed(log.insight))
                 self.brain.focus_on(nid)
                 print(f"  Insight: {log.insight[:80]}...")
 

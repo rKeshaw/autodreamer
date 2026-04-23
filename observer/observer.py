@@ -2,12 +2,14 @@ import json
 import time
 import numpy as np
 from dataclasses import dataclass, field
-from graph.brain import Brain, EdgeType, NodeType
+from graph.brain import Brain, EdgeType, NodeStatus, NodeType
 from dreamer.dreamer import DreamLog, DreamStep
 from config import THRESHOLDS
 from embedding import embed as shared_embed
 from persistence import atomic_write_json
 from llm_utils import llm_call
+from scientist_workspace import ArtifactStatus
+from scientific_rigor import deterministic_progress_stage, normalize_text
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +21,10 @@ SIMILARITY_HIGH            = THRESHOLDS.QUESTION_DEDUP_HIGH
 SIMILARITY_MID             = THRESHOLDS.QUESTION_DEDUP_LOW
 MAX_EMERGENCES_PER_TYPE    = 2
 EMERGENCE_COOLDOWN_HOURS   = 24
+MAX_UNRESOLVED_AGENDA      = 60
+MAX_RESOLVED_AGENDA        = 30
+STALE_INCUBATION_AGE       = 10
+STALE_PRIORITY_CUTOFF      = 0.25
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -135,15 +141,44 @@ Central research question: "{mission}"
 These are the most significant advances toward this question made so far:
 {advances}
 
-These are the strongest insights found:
-{insights}
+Grounded evidence currently available:
+{grounded_evidence}
+
+Working hypotheses and prior claims:
+{hypotheses}
 
 These are the main open tensions still unresolved:
 {contradictions}
 
+Current next tasks:
+{next_tasks}
+
 In 3-4 sentences, summarize how close the mind is to answering the central question.
 What is the current best partial answer? What is the key remaining gap?
 Write like a scientist assessing their own progress.
+"""
+
+
+PIVOT_PROMPT = """
+You are the scientific orchestrator evaluating the overarching research agenda.
+
+Our current mission was:
+"{old_mission}"
+
+We have encountered sweeping failure. The ratio of contradicted or dead-end 
+hypotheses to successful ones is overwhelming. Here are the most prominent 
+anomalies and contradicted ideas we found instead:
+{anomalies}
+
+Your job is to generate a COMPLETELY NEW MISSION that abandons the old paradigm 
+entirely and specifically leans into these anomalies. Treat the failures as the 
+starting point of a new field. We must pivot.
+
+Return the new mission statement exactly:
+{{
+  "new_mission_statement": "A single bold central research question.",
+  "justification": "Why this pivot makes our failures irrelevant."
+}}
 """
 
 # ── Observer ──────────────────────────────────────────────────────────────────
@@ -159,6 +194,7 @@ class Observer:
         self.cycle_count                       = 0
         self._cycle_emergence_counts: dict     = {}
         self._emergence_last_fired: dict       = {}
+        self.lab_meeting = None
 
     def _llm(self, prompt: str, temperature: float = 0.5) -> str:
         return llm_call(prompt, temperature=temperature, role="precise")
@@ -172,6 +208,69 @@ class Observer:
     def _mission_text(self) -> str:
         m = self.brain.get_mission()
         return m['question'] if m else "No central question set."
+
+    def _normalize_text(self, text: str) -> str:
+        return " ".join(str(text or "").lower().split())
+
+    def _blocking_objection_count(self, node_id: str) -> int:
+        if not self.lab_meeting or not hasattr(self.lab_meeting, "get_hypothesis_state"):
+            return 0
+        try:
+            state = self.lab_meeting.get_hypothesis_state(node_id)
+        except Exception:
+            return 0
+        return int(state.get("blocking_objection_count", 0) or 0)
+
+    def _node_supports_mission_advance(self, node_id: str, strength: float) -> bool:
+        node = self.brain.get_node(node_id)
+        if not node:
+            return True
+        node_type = node.get("node_type")
+        epistemic = node.get("epistemic_status")
+        status = node.get("status")
+        if epistemic in {
+            ArtifactStatus.CONTRADICTED.value,
+            ArtifactStatus.SPECULATIVE.value,
+            ArtifactStatus.LACKS_EVIDENCE.value,
+        }:
+            return False
+        if node_type in {
+            NodeType.EVIDENCE_CLAIM.value,
+            NodeType.EMPIRICAL.value,
+            NodeType.ANSWER.value,
+        }:
+            return epistemic == ArtifactStatus.GROUNDED.value
+        if node_type == NodeType.HYPOTHESIS.value:
+            if status != NodeStatus.UNCERTAIN.value:
+                return False
+            if self._blocking_objection_count(node_id) > 0:
+                return False
+            incoming = list(self.brain.graph.in_edges(node_id, data=True))
+            return any(
+                self.brain.get_node(source_id) and
+                self.brain.get_node(source_id).get("epistemic_status") == ArtifactStatus.GROUNDED.value and
+                edge.get("type") in {
+                    EdgeType.CONFIRMED_BY.value,
+                    EdgeType.SUPPORTS.value,
+                    EdgeType.EMPIRICALLY_TESTED.value,
+                }
+                for source_id, _, edge in incoming
+            ) or strength < 0.7
+        return strength < 0.7
+
+    def _render_emergence_signal(self, type: str, detail: str) -> str:
+        detail = normalize_text(detail)
+        templates = {
+            "mission_advance": "A grounded result materially narrows the mission.",
+            "hypothesis_advanced": "A hypothesis gained mechanism-specific support.",
+            "recurring_question": f"Recurring unresolved question: {detail[:96]}",
+            "long_incubation": f"Persistent unresolved issue: {detail[:96]}",
+            "repeated_weak_edge": "A weak association is being revisited without strong support.",
+            "cross_cluster_insight": f"Cross-cluster mapping survived coherence screening: {detail[:96]}",
+            "contradiction_circled": f"An active contradiction remains unresolved: {detail[:96]}",
+            "incubation_resolved": f"Long-incubated question received a grounded answer: {detail[:96]}",
+        }
+        return templates.get(type, detail[:120] or "Scientific state changed.")
 
     # ── Similarity ────────────────────────────────────────────────────────────
 
@@ -219,6 +318,56 @@ class Observer:
         unresolved = [i for i in self.agenda if not i.resolved]
         return sorted(unresolved, key=lambda i: i.priority, reverse=True)[:n]
 
+    def _prune_agenda(self):
+        """Prevent agenda bloat by keeping only high-value active items."""
+        if not self.agenda:
+            return
+
+        items = list(zip(self.agenda, self.agenda_embeddings))
+
+        # Mark stale unresolved items as resolved when they have remained low
+        # priority for many cycles without producing leads.
+        stale_marked = 0
+        for item, _ in items:
+            if item.resolved:
+                continue
+            if (item.incubation_age >= STALE_INCUBATION_AGE and
+                    item.priority < STALE_PRIORITY_CUTOFF and
+                    not item.partial_leads):
+                item.resolved = True
+                item.resolution_grade = "stale_pruned"
+                stale_marked += 1
+
+        unresolved = [p for p in items if not p[0].resolved]
+        resolved = [p for p in items if p[0].resolved]
+
+        dropped = 0
+        if len(unresolved) > MAX_UNRESOLVED_AGENDA:
+            unresolved = sorted(
+                unresolved,
+                key=lambda p: (p[0].priority, p[0].count, -p[0].incubation_age),
+                reverse=True,
+            )
+            dropped = len(unresolved) - MAX_UNRESOLVED_AGENDA
+            unresolved = unresolved[:MAX_UNRESOLVED_AGENDA]
+
+        if len(resolved) > MAX_RESOLVED_AGENDA:
+            resolved = sorted(
+                resolved,
+                key=lambda p: (p[0].priority, p[0].count),
+                reverse=True,
+            )[:MAX_RESOLVED_AGENDA]
+
+        new_items = unresolved + resolved
+        self.agenda = [item for item, _ in new_items]
+        self.agenda_embeddings = [emb for _, emb in new_items]
+
+        if stale_marked or dropped:
+            print(
+                f"   Agenda pruned: stale_marked={stale_marked}, "
+                f"dropped_unresolved={dropped}"
+            )
+
     def record_answer(self, question_text: str, answer_node_id: str,
                       explanation: str, grade: str = "strong"):
         for item in self.agenda:
@@ -264,6 +413,21 @@ class Observer:
     def record_mission_advance(self, node_id: str, explanation: str,
                                strength: float):
         """Record a significant advance toward the central question."""
+        if not self._node_supports_mission_advance(node_id, strength):
+            print("  · Mission advance rejected: evidence not yet strong enough.")
+            return
+        normalized_explanation = self._normalize_text(explanation)
+        for advance in reversed(self.mission_advances[-12:]):
+            if advance.cycle != self.cycle_count:
+                continue
+            if advance.node_id != node_id:
+                continue
+            if self._normalize_text(advance.explanation) != normalized_explanation:
+                continue
+            if strength > advance.strength:
+                advance.strength = strength
+                advance.explanation = explanation
+            return
         advance = MissionAdvance(
             node_id     = node_id,
             explanation = explanation,
@@ -294,45 +458,48 @@ class Observer:
             key=lambda a: a.strength, reverse=True
         )[:5]
 
-        # get strongest insights from dream logs
-        insights = []
-        try:
-            import os
-            dream_files = [
-                fname for fname in sorted(os.listdir("logs"), reverse=True)
-                if fname.startswith("dream_cycle") and fname.endswith(".json")
-            ]
-            if not dream_files:
-                print("Observer: no dream_cycle*.json files found for mission summary.")
-            for fname in dream_files[:5]:
-                with open(f"logs/{fname}") as f:
-                    d = json.load(f)
-                for ins in d.get("insights", []):
-                    if ins.get("depth") in ["structural", "isomorphism"]:
-                        insights.append(ins.get("narration", ""))
-        except Exception:
-            pass
-
-        # get active contradictions
-        contradictions = []
-        for u, v, data in list(self.brain.graph.edges(data=True))[:50]:
-            if data.get('type') == 'contradicts':
-                nu = self.brain.get_node(u)
-                nv = self.brain.get_node(v)
-                if nu and nv:
-                    contradictions.append(
-                        f"{nu['statement']} vs {nv['statement']}")
-                if len(contradictions) >= 3:
-                    break
-
-        return self._llm(MISSION_SUMMARY_PROMPT.format(
-            mission       = mission['question'],
-            advances      = "\n".join(
-                f"- ({a.strength:.2f}) {a.explanation}"
-                for a in top_advances) or "none yet",
-            insights      = "\n".join(f"- {i}" for i in insights) or "none yet",
-            contradictions= "\n".join(f"- {c}" for c in contradictions) or "none"
-        ), temperature=0.4)
+        workspace = self.brain.build_workspace()
+        grounded_evidence = "\n".join(
+            node.prompt_line() for node in workspace.grounded_evidence[:5]
+        ) or "none yet"
+        hypotheses = "\n".join(
+            node.prompt_line()
+            for node in (workspace.working_hypotheses + workspace.prior_claims)[:5]
+        ) or "none yet"
+        contradictions = "\n".join(
+            f"- {item}" for item in workspace.contradictions[:4]
+        ) or "none"
+        next_tasks = "\n".join(
+            node.prompt_line() for node in workspace.next_tasks[:4]
+        ) or "none"
+        blocker_count = sum(
+            self._blocking_objection_count(node.id)
+            for node in workspace.working_hypotheses[:4]
+        )
+        stage = deterministic_progress_stage(
+            grounded_count=len(workspace.grounded_evidence),
+            supported_hypotheses=len(workspace.working_hypotheses),
+            blocker_count=blocker_count,
+        )
+        advances_text = "\n".join(
+            f"- ({a.strength:.2f}) {a.explanation}"
+            for a in top_advances
+        ) or "- none yet"
+        return "\n".join([
+            f"Mission: {mission['question']}",
+            f"Stage: {stage}",
+            "Best grounded evidence:",
+            grounded_evidence if grounded_evidence != "none yet" else "- none yet",
+            "Current supported hypotheses:",
+            hypotheses if hypotheses != "none yet" else "- none yet",
+            "Material advances:",
+            advances_text,
+            "Open tensions:",
+            contradictions if contradictions != "none" else "- none",
+            "Next tasks:",
+            next_tasks if next_tasks != "none" else "- none",
+            f"Review blockers: {blocker_count}",
+        ])
 
     # ── Incubation ────────────────────────────────────────────────────────────
 
@@ -438,10 +605,7 @@ class Observer:
         count = self._cycle_emergence_counts.get(type, 0)
         if count >= MAX_EMERGENCES_PER_TYPE:
             return
-        signal_text = self._llm(EMERGENCE_PROMPT.format(
-            mission=self._mission_text(),
-            type=type, detail=detail
-        ), temperature=0.5)
+        signal_text = self._render_emergence_signal(type, detail)
         signal = EmergenceSignal(
             signal=signal_text, type=type,
             cycle=cycle, node_ids=node_ids or []
@@ -485,6 +649,7 @@ class Observer:
         self._check_cross_cluster_insights(log.steps, cycle)
         if increment_incubation:
             self.increment_incubation()
+        self._prune_agenda()
 
         resolved = sum(1 for i in self.agenda if i.resolved)
         print(f"   Agenda: {len(self.agenda)} ({resolved} resolved)")
@@ -493,6 +658,93 @@ class Observer:
               f"{sum(self._cycle_emergence_counts.values())} "
               f"total: {len(self.emergence_feed)}")
         print(f"── Observer done ──\n")
+
+
+    def reflection_week(self) -> dict | None:
+        """Evaluate the overall failure ratio and pivot mission if necessary."""
+        print(f"\n  ── 🧭 Weekly Reflection (Cycle {self.cycle_count}) ──")
+        
+        # Calculate failure vs success among investigated hypotheses
+        hypotheses = self.brain.nodes_by_type("hypothesis")
+        
+        failed = []
+        succeeded_or_working = []
+        
+        from graph.brain import NodeStatus, ArtifactStatus
+        for nid, data in hypotheses:
+            status = data.get("status")
+            if status in [NodeStatus.CONTRADICTED.value, NodeStatus.LACKS_EVIDENCE.value]:
+                failed.append((nid, data))
+            elif status in [NodeStatus.SETTLED.value, NodeStatus.UNCERTAIN.value]: # uncertain means working/promoted
+                succeeded_or_working.append((nid, data))
+                
+        total_investigated = len(failed) + len(succeeded_or_working)
+        
+        if total_investigated == 0:
+            print("     Insufficient hypothesis testing data. No pivot required.")
+            return None
+            
+        failure_ratio = len(failed) / total_investigated
+        unresolved_review_blockers = sum(
+            self._blocking_objection_count(nid) for nid, _ in hypotheses
+        )
+        print(f"     Failure Ratio: {len(failed)}/{total_investigated} ({failure_ratio*100:.1f}%)")
+        if unresolved_review_blockers:
+            print(f"     Review blockers still open: {unresolved_review_blockers}")
+        
+        # Threshold for pivot: 80% failure (0.8) among tested concepts
+        # For testing purposes, we'll allow an easy trigger if we pass a minimum threshold or override
+        if failure_ratio >= 0.8 and len(failed) >= 3:
+            print("  ‼️  CRITICAL FAILURE THRESHOLD REACHED. PIVOT TRIGGERED ‼️")
+            
+            anomalies = [data.get('statement', '') for _, data in sorted(
+                failed, key=lambda x: x[1].get('importance', 0), reverse=True
+            )[:5]]
+            
+            old_mission_question = self._mission_text()
+            
+            from llm_utils import require_json
+            raw_pivot = self._llm(PIVOT_PROMPT.format(
+                old_mission=old_mission_question,
+                anomalies="\n".join(f"- {a}" for a in anomalies)
+            ), temperature=0.7)
+            
+            p_data = require_json(raw_pivot, default={
+                "new_mission_statement": "Are these anomalies a unified phenomenon?",
+                "justification": "Graceful LLM parsing failure fallback."
+            })
+            
+            new_mission = p_data.get("new_mission_statement", "")
+            if not new_mission:
+                new_mission = "Investigate the recent anomalies."
+                
+            print(f"     Old Mission: {old_mission_question[:60]}...")
+            print(f"     New Mission: {new_mission[:60]}...\n")
+            
+            # Archive old mission in brain
+            if self.brain.mission:
+                old_m_id = self.brain.mission.get("id")
+                if old_m_id:
+                    self.brain.update_node(old_m_id, status=NodeStatus.CONTRADICTED.value, epistemic_status=ArtifactStatus.CONTRADICTED.value)
+            
+            old_mission_context = (self.brain.mission or {}).get("context", "")
+            
+            # Set new mission
+            self.brain.set_mission(new_mission, context=f"Pivot from failures. Justification: {p_data.get('justification', '')}")
+            
+            return {
+                "pivot_triggered": True,
+                "old_mission": old_mission_question,
+                "new_mission": new_mission,
+                "anomalies": anomalies,
+                "justification": p_data.get("justification", "")
+            }
+                
+        if unresolved_review_blockers:
+            print("     Research remains viable, but review blockers still prevent strong scientific promotion.")
+            return None
+        print("     Research remains viable. No pivot required.")
+        return None
 
     def observe(self, log: DreamLog):
         self._observe_internal(
@@ -503,6 +755,49 @@ class Observer:
         self._observe_internal(
             log, increment_cycle=False, increment_incubation=False
         )
+
+    # ── Reference cleanup ───────────────────────────────────────────────────
+
+    def remove_node_references(self, removed_node_ids: list[str] | set[str]) -> dict:
+        """Remove dangling references to pruned graph nodes."""
+        removed = set(removed_node_ids or [])
+        if not removed:
+            return {"cleaned": 0}
+
+        cleaned = 0
+
+        for item in self.agenda:
+            if item.node_id in removed:
+                item.node_id = ""
+                cleaned += 1
+            if item.answer_node_id in removed:
+                item.answer_node_id = ""
+                cleaned += 1
+            before = len(item.partial_leads)
+            item.partial_leads = [nid for nid in item.partial_leads if nid not in removed]
+            cleaned += max(0, before - len(item.partial_leads))
+
+        before_adv = len(self.mission_advances)
+        self.mission_advances = [a for a in self.mission_advances if a.node_id not in removed]
+        cleaned += max(0, before_adv - len(self.mission_advances))
+
+        for signal in self.emergence_feed:
+            before = len(signal.node_ids)
+            signal.node_ids = [nid for nid in signal.node_ids if nid not in removed]
+            cleaned += max(0, before - len(signal.node_ids))
+
+        before_edges = len(self.edge_traversal_counts)
+        self.edge_traversal_counts = {
+            key: val for key, val in self.edge_traversal_counts.items()
+            if key[0] not in removed and key[1] not in removed
+        }
+        cleaned += max(0, before_edges - len(self.edge_traversal_counts))
+
+        return {
+            "cleaned": cleaned,
+            "agenda_items": len(self.agenda),
+            "mission_advances": len(self.mission_advances),
+        }
 
     # ── Persistence ──────────────────────────────────────────────────────────
 

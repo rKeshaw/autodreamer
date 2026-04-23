@@ -40,6 +40,7 @@ class EmbeddingIndex:
         self._embeddings: dict[str, np.ndarray] = {}  # node_id -> vector
         self._next_int = 0
         self._index = faiss.IndexFlatIP(dimension)
+        self._dirty = False  # True when embeddings updated but index not rebuilt
 
     @property
     def size(self) -> int:
@@ -54,9 +55,9 @@ class EmbeddingIndex:
 
         if node_id in self._id_to_int:
             # FAISS IndexFlatIP doesn't support in-place update —
-            # store the new embedding and rebuild lazily
+            # store the new embedding and defer rebuild to flush()
             self._embeddings[node_id] = embedding[0]
-            self._rebuild()
+            self._dirty = True
             return
 
         int_id = self._next_int
@@ -68,11 +69,29 @@ class EmbeddingIndex:
         self._index.add(embedding)
 
     def remove(self, node_id: str):
-        """Remove a node from the index. Triggers rebuild."""
-        if node_id not in self._id_to_int:
+        """Remove a node from the index. Defers rebuild to flush()."""
+        if node_id not in self._embeddings:
             return
         del self._embeddings[node_id]
-        self._rebuild()
+        self._dirty = True
+
+    def prune_node_ids(self, node_ids: list[str] | set[str]) -> int:
+        """Remove multiple node IDs and flush immediately for consistency."""
+        removed = 0
+        for node_id in node_ids or []:
+            if node_id in self._embeddings:
+                del self._embeddings[node_id]
+                removed += 1
+        if removed:
+            self._dirty = True
+            self.flush()
+        return removed
+
+    def flush(self):
+        """Rebuild FAISS index if any deferred updates/removals exist."""
+        if self._dirty:
+            self._rebuild()
+            self._dirty = False
 
     def _rebuild(self):
         """Rebuild the FAISS index from scratch using stored embeddings."""

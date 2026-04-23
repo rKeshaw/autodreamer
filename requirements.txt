@@ -13,3 +13,4 @@ pydantic
 loguru
 pytest
 faiss-cpu
+pypdf

@@ -29,6 +29,8 @@ MANIFEST
 logs/
 data/
 *.txt
+virtual_lab/
+tests/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

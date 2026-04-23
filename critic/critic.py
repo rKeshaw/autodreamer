@@ -34,6 +34,8 @@ from graph.brain import Brain, NodeType
 from config import CRITIC as CRITIC_CFG
 from llm_utils import llm_call, llm_json
 from embedding import embed as shared_embed
+from scientist_workspace import ArtifactStatus
+from scientific_rigor import hypothesis_requires_formalism
 
 
 # ── Verdict enum ──────────────────────────────────────────────────────────────
@@ -60,6 +62,9 @@ class CandidateThought:
     node_b_id:       str = ""          # Target node (for edge candidates)
     crosses_domains: bool = False      # Whether the claim connects different clusters
     contradicts_existing: bool = False # Whether the claim conflicts with existing knowledge
+    grounded_evidence: list[str] = field(default_factory=list)
+    source_ids:       list[str] = field(default_factory=list)
+    expected_status:  str = ArtifactStatus.OPEN.value
 
 
 # ── Dialogue turn ─────────────────────────────────────────────────────────────
@@ -370,6 +375,9 @@ class Critic:
         if candidate.contradicts_existing:
             return True
 
+        if candidate.expected_status == ArtifactStatus.GROUNDED.value:
+            return True
+
         # ── Type-based routing ──
         claim_type = candidate.edge_type or candidate.proposed_type
 
@@ -420,7 +428,23 @@ class Critic:
             return log
 
         print(f"\n  ── System 2 review [{candidate.proposed_type}] ──")
-        print(f"  Claim: {candidate.claim[:80]}...")
+        display_claim = self._formalize_dialogue_text(candidate.claim) or candidate.claim
+        print(f"  Claim: {display_claim[:80]}...")
+
+        evaluation_context = self._evaluation_context(candidate)
+        if (
+            candidate.expected_status == ArtifactStatus.GROUNDED.value and
+            not self._has_grounding_context(candidate, evaluation_context)
+        ):
+            log.verdict = Verdict.DEFER
+            log.final_claim = candidate.claim
+            log.verdict_reason = (
+                "Grounded status was requested, but the claim arrived without "
+                "linked evidence or source context."
+            )
+            log.duration = time.time() - start
+            print("  ◇ DEFER: missing grounding context for grounded claim")
+            return log
 
         # ── Novelty check ──
         is_novel = self._check_novelty(candidate.claim)
@@ -437,7 +461,7 @@ class Critic:
             return log
 
         # ── Triviality check ──
-        if self._check_triviality(candidate.claim, candidate.context):
+        if self._check_triviality(candidate.claim, evaluation_context):
             log.verdict = Verdict.REJECT
             log.final_claim = candidate.claim
             log.rejection_reason = ("Trivial — this claim restates a well-known "
@@ -492,8 +516,8 @@ class Critic:
           3. Repeat up to MAX_DIALOGUE_TURNS
         """
         turns = []
-        current_claim = candidate.claim
-        context = candidate.context or self._build_context(candidate)
+        current_claim = self._formalize_dialogue_text(candidate.claim) or candidate.claim
+        context = self._evaluation_context(candidate)
         prior_challenges = []
         issue_resolution = {}
 
@@ -697,10 +721,14 @@ class Critic:
         if verdict == Verdict.REFINE and not refined_claim:
             refined_claim = verdict_final_claim
 
-        if verdict in {Verdict.DEFER, Verdict.REFINE} and self._dialogue_supports_provisional_accept(
-            candidate.claim,
-            verdict_final_claim or refined_claim,
-            dialogue,
+        if (
+            self._is_deep_analogy_candidate(candidate) and
+            verdict in {Verdict.DEFER, Verdict.REFINE} and
+            self._dialogue_supports_provisional_accept(
+                candidate.claim,
+                verdict_final_claim or refined_claim,
+                dialogue,
+            )
         ):
             verdict = Verdict.ACCEPT
             best_supported_claim = (
@@ -725,6 +753,26 @@ class Critic:
                 result["reason"] = (
                     f"Confidence {confidence:.2f} below floor {floor:.2f}. Deferring."
                 )
+        if verdict == Verdict.ACCEPT and self._context_uses_local_artifacts(dialogue_text):
+            if not self._context_has_external_support(dialogue_text):
+                verdict = Verdict.DEFER
+                result["reason"] = (
+                    "Self-generated session artifacts are not sufficient external evidence."
+                )
+        if (
+            verdict == Verdict.ACCEPT and
+            (candidate.proposed_type or "").lower() == NodeType.HYPOTHESIS.value and
+            hypothesis_requires_formalism(verdict_final_claim or candidate.claim) and
+            not self._context_has_formal_support(
+                candidate,
+                verdict_final_claim or candidate.claim,
+                dialogue_text,
+            )
+        ):
+            verdict = Verdict.DEFER
+            result["reason"] = (
+                "The hypothesis introduces mechanistic or formal machinery without an explicit derivation, bound, or cited evidence."
+            )
 
         # ── Thesis survival guard ──
         # If the accepted claim drifted significantly from the original,
@@ -932,6 +980,31 @@ class Critic:
         """
         lines = []
 
+        if candidate.expected_status:
+            lines.append(f"[EXPECTED EPISTEMIC STATUS] {candidate.expected_status}")
+
+        if candidate.grounded_evidence:
+            lines.append("[LINKED SOURCES]")
+            for ref in candidate.grounded_evidence[:5]:
+                if ref:
+                    lines.append(f"- {ref}")
+
+        if candidate.source_ids:
+            lines.append("[SOURCE MATERIAL]")
+            for source_id in candidate.source_ids[:3]:
+                source_node = self.brain.get_node(source_id)
+                if not source_node:
+                    continue
+                title = source_node.get("statement", "")
+                refs = source_node.get("source_refs", []) or []
+                ref_text = f" ({refs[0]})" if refs else ""
+                excerpt = (source_node.get("source_excerpt", "") or "").strip()
+                if excerpt:
+                    excerpt = excerpt[:400]
+                    lines.append(f"- {title}{ref_text}: {excerpt}")
+                else:
+                    lines.append(f"- {title}{ref_text}")
+
         # If this is an edge claim, get the source/target node statements
         if candidate.node_a_id:
             node_a = self.brain.get_node(candidate.node_a_id)
@@ -959,6 +1032,31 @@ class Critic:
 
         return "\n\n".join(lines) if lines else "No additional context available."
 
+    def _evaluation_context(self, candidate: CandidateThought) -> str:
+        parts = []
+        if candidate.context and candidate.context.strip():
+            parts.append(candidate.context.strip())
+        built_context = self._build_context(candidate)
+        if built_context and built_context != "No additional context available.":
+            parts.append(built_context)
+        if not parts:
+            return "No additional context available."
+
+        deduped = []
+        for part in parts:
+            if part not in deduped:
+                deduped.append(part)
+        return "\n\n".join(deduped)
+
+    def _has_grounding_context(self, candidate: CandidateThought, context: str) -> bool:
+        if candidate.grounded_evidence or candidate.source_ids:
+            return True
+        lowered = (context or "").lower()
+        return any(
+            marker in lowered
+            for marker in ("[source material]", "[linked sources]", "source:")
+        )
+
     def _dialogue_history_text(self, turns: list[DialogueTurn]) -> str:
         if not turns:
             return "No prior review turns."
@@ -975,7 +1073,16 @@ class Critic:
         return re.sub(r"[^a-z0-9 ]+", " ", text)
 
     def _formalize_dialogue_text(self, text: str) -> str:
-        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        cleaned = str(text or "")
+        cleaned = cleaned.replace("→", " maps to ")
+        cleaned = cleaned.replace("↔", " corresponds to ")
+        cleaned = cleaned.replace("⇒", " implies ")
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
+        cleaned = re.sub(r"\$+", " ", cleaned)
+        cleaned = re.sub(r"\\(?:rightarrow|to)\b", " maps to ", cleaned)
+        cleaned = re.sub(r"\\[A-Za-z]+(?:\{[^{}]*\})*", " ", cleaned)
+        cleaned = re.sub(r"[_^{}]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         for pattern, replacement in self._FORMAL_REPLACEMENTS:
             cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", cleaned).strip()
@@ -1034,6 +1141,66 @@ class Critic:
         if self._is_deep_analogy_candidate(candidate):
             return max(floor, 0.65)
         return floor
+
+    def _context_has_external_support(self, context: str) -> bool:
+        lowered = str(context or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "https://",
+                "http://",
+                "arxiv.org",
+                "doi.org",
+                "journals.aps.org",
+                "nature.com",
+                "science.org",
+                "inspirehep.net",
+                "pdg.lbl.gov",
+            )
+        )
+
+    def _context_uses_local_artifacts(self, context: str) -> bool:
+        lowered = str(context or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "file://",
+                "/home/",
+                "virtual_lab/",
+                "session_summary",
+                "stdout.txt",
+                "stderr.txt",
+                "logs/",
+            )
+        )
+
+    def _context_has_formal_support(self, candidate: CandidateThought,
+                                    claim: str,
+                                    dialogue_text: str) -> bool:
+        context = "\n".join(filter(None, [
+            candidate.context,
+            self._evaluation_context(candidate),
+            dialogue_text,
+            claim,
+        ])).lower()
+        if candidate.grounded_evidence:
+            return True
+        return any(
+            marker in context
+            for marker in (
+                "equation",
+                "operator",
+                "lagrangian",
+                "hamiltonian",
+                "constraint",
+                "derive",
+                "derivation",
+                "measured",
+                "bounded by",
+                "confidence interval",
+                "upper limit",
+            )
+        )
 
     def _has_mapping_markers(self, claim: str) -> bool:
         text = (claim or "").lower()
@@ -1170,7 +1337,7 @@ class Critic:
 
         Returns a new CandidateThought with the refined claim.
         """
-        context = candidate.context or self._build_context(candidate)
+        context = self._evaluation_context(candidate)
 
         base_claim = critic_log.final_claim or candidate.claim
 
@@ -1200,6 +1367,9 @@ class Critic:
             node_b_id         = candidate.node_b_id,
             crosses_domains   = candidate.crosses_domains,
             contradicts_existing = candidate.contradicts_existing,
+            grounded_evidence = list(candidate.grounded_evidence),
+            source_ids        = list(candidate.source_ids),
+            expected_status   = candidate.expected_status,
         )
 
     # ── Full evaluate-with-refinement loop ────────────────────────────────────

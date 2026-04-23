@@ -1,19 +1,40 @@
+import io
 import json
 import os
+import re
 import time
+import urllib.parse
 import uuid
-import requests
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+
+import requests
+
 from graph.brain import Brain, EdgeSource
 from ingestion.ingestor import Ingestor
-from persistence import atomic_write_json
 from llm_utils import llm_call
+from persistence import atomic_write_json
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 READING_LIST_PATH = "data/reading_list.json"
 MAX_TEXT_CHARS    = 32000  # ~8-10 pages of content
+MAX_PDF_TEXT_CHARS = 140000
 MIN_TEXT_CHARS    = 200    # ignore tiny pages
+MIN_SECTION_CHARS = 120
+ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+ARXIV_ID_RE = re.compile(
+    r"(?:arxiv\.org/(?:abs|pdf)/)?"
+    r"(?P<id>(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z\-]+)?/\d{7})(?:v\d+)?)",
+    re.IGNORECASE,
+)
+SECTION_HEADING_RE = re.compile(
+    r"^(?:\d+(?:\.\d+){0,2}\s+)?"
+    r"(abstract|introduction|background|related work|methods?|methodology|"
+    r"materials|results?|discussion|conclusion|limitations|references)\b",
+    re.IGNORECASE,
+)
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -68,8 +89,8 @@ Respond ONLY with a JSON array of objects:
 [
   {{
     "title": "Article or topic title",
-    "url": "https://en.wikipedia.org/wiki/... or arxiv search term",
-    "source_type": "wikipedia or arxiv",
+        "url": "https://en.wikipedia.org/wiki/... or arxiv search term",
+        "source_type": "wikipedia or arxiv_query",
     "reason": "one sentence explaining why this would be valuable"
   }}
 ]
@@ -104,7 +125,7 @@ class ReadingEntry:
     id:          str   = field(default_factory=lambda: str(uuid.uuid4()))
     url:         str   = ""
     title:       str   = ""
-    source_type: str   = "web"      # wikipedia | arxiv | web | pdf | text
+    source_type: str   = "web"      # wikipedia | arxiv_query | arxiv_paper | web | pdf | text
     priority:    float = 0.5
     status:      str   = "unread"   # unread | reading | read | failed
     added_by:    str   = "user"     # user | system | dream | auto
@@ -112,6 +133,11 @@ class ReadingEntry:
     raw_text:    str   = ""
     absorbed_at: float = 0.0
     node_count:  int   = 0          # nodes added when absorbed
+    resolved_arxiv_id: str = ""
+    resolved_pdf_url:  str = ""
+    resolved_from_query: str = ""
+    section_count: int = 0
+    section_labels: list[str] = field(default_factory=list)
 
     def to_dict(self):
         return self.__dict__
@@ -133,7 +159,8 @@ class AbsorptionResult:
 
 class Reader:
     def __init__(self, brain: Brain, observer=None, notebook=None,
-                 ingestor=None, embedding_index=None, insight_buffer=None):
+                 ingestor=None, embedding_index=None,
+                 insight_buffer=None, critic=None):
         self.brain    = brain
         self.observer = observer
         self.notebook = notebook
@@ -141,7 +168,8 @@ class Reader:
             brain,
             research_agenda=observer,
             embedding_index=embedding_index,
-            insight_buffer=insight_buffer
+            insight_buffer=insight_buffer,
+            critic=critic
         )
         self.reading_list: list[ReadingEntry] = []
         self._load_list()
@@ -149,16 +177,130 @@ class Reader:
     def _llm(self, prompt: str, temperature: float = 0.6) -> str:
         return llm_call(prompt, temperature=temperature, role="precise")
 
+    def _normalize_source_type(self, source_type: str) -> str:
+        stype = (source_type or "web").strip().lower()
+        legacy_aliases = {
+            "arxiv": "arxiv_query",
+        }
+        return legacy_aliases.get(stype, stype)
+
+    def _extract_arxiv_id(self, value: str) -> str:
+        match = ARXIV_ID_RE.search(value or "")
+        return match.group("id") if match else ""
+
+    def _arxiv_abs_url(self, arxiv_id: str) -> str:
+        return f"https://arxiv.org/abs/{arxiv_id}"
+
+    def _arxiv_pdf_url(self, arxiv_id_or_url: str) -> str:
+        arxiv_id = self._extract_arxiv_id(arxiv_id_or_url)
+        if not arxiv_id:
+            return ""
+        return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+    def _parse_arxiv_entry(self, entry_el: ET.Element) -> dict:
+        title_el = entry_el.find("atom:title", ARXIV_NS)
+        summary_el = entry_el.find("atom:summary", ARXIV_NS)
+        id_el = entry_el.find("atom:id", ARXIV_NS)
+
+        title = " ".join((title_el.text or "").split()) if title_el is not None else ""
+        summary = " ".join((summary_el.text or "").split()) if summary_el is not None else ""
+
+        abs_url = (id_el.text or "").strip() if id_el is not None else ""
+        arxiv_id = self._extract_arxiv_id(abs_url)
+        if not abs_url and arxiv_id:
+            abs_url = self._arxiv_abs_url(arxiv_id)
+
+        pdf_url = ""
+        for link_el in entry_el.findall("atom:link", ARXIV_NS):
+            href = (link_el.get("href") or "").strip()
+            title_attr = (link_el.get("title") or "").strip().lower()
+            if title_attr == "pdf" or href.endswith(".pdf"):
+                pdf_url = href
+                break
+        if not pdf_url and arxiv_id:
+            pdf_url = self._arxiv_pdf_url(arxiv_id)
+
+        return {
+            "title": title,
+            "abstract": summary,
+            "arxiv_id": arxiv_id,
+            "abs_url": abs_url,
+            "pdf_url": pdf_url,
+        }
+
+    def _fetch_arxiv_metadata(self, arxiv_id_or_url: str) -> tuple[dict | None, str]:
+        arxiv_id = self._extract_arxiv_id(arxiv_id_or_url)
+        if not arxiv_id:
+            return None, "Could not extract arXiv ID"
+
+        try:
+            resp = requests.get(
+                ARXIV_API_URL,
+                params={"id_list": arxiv_id},
+                timeout=15,
+                headers={"User-Agent": "DREAMER/1.0"},
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            entry_el = root.find("atom:entry", ARXIV_NS)
+            if entry_el is None:
+                return None, f"No arXiv record found for ID {arxiv_id}"
+            return self._parse_arxiv_entry(entry_el), ""
+        except Exception as e:
+            return None, f"Error fetching arXiv metadata: {e}"
+
+    def _resolve_arxiv_query(self, query: str) -> tuple[dict | None, str]:
+        query = (query or "").strip()
+        if not query:
+            return None, "Empty arXiv query"
+
+        if self._extract_arxiv_id(query):
+            metadata, error = self._fetch_arxiv_metadata(query)
+            if metadata is not None:
+                metadata["query"] = query
+            return metadata, error
+
+        try:
+            resp = requests.get(
+                ARXIV_API_URL,
+                params={
+                    "search_query": f"all:{query}",
+                    "start": 0,
+                    "max_results": 1,
+                    "sortBy": "relevance",
+                    "sortOrder": "descending",
+                },
+                timeout=15,
+                headers={"User-Agent": "DREAMER/1.0"},
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            entry_el = root.find("atom:entry", ARXIV_NS)
+            if entry_el is None:
+                return None, f"No arXiv results found for query '{query}'"
+            metadata = self._parse_arxiv_entry(entry_el)
+            metadata["query"] = query
+            return metadata, ""
+        except Exception as e:
+            return None, f"Error resolving arXiv query: {e}"
+
     # ── Reading list management ───────────────────────────────────────────────
 
     def _load_list(self):
         try:
             with open(READING_LIST_PATH, 'r') as f:
                 data = json.load(f)
+            migrated = False
             for entry in data:
                 if entry.get("source_type") == "text" and not entry.get("raw_text"):
                     entry["raw_text"] = entry.get("added_reason", "")
+                normalized = self._normalize_source_type(entry.get("source_type", "web"))
+                if normalized != entry.get("source_type", "web"):
+                    entry["source_type"] = normalized
+                    migrated = True
             self.reading_list = [ReadingEntry(**e) for e in data]
+            if migrated:
+                self._save_list()
             print(f"Reading list loaded — {len(self.reading_list)} entries "
                   f"({sum(1 for e in self.reading_list if e.status=='unread')} unread)")
         except FileNotFoundError:
@@ -173,6 +315,7 @@ class Reader:
     def add_to_list(self, url: str, title: str = "", source_type: str = "web",
                     priority: float = 0.5, added_by: str = "user",
                     reason: str = "") -> ReadingEntry:
+        source_type = self._normalize_source_type(source_type)
         # check for duplicate URL
         for existing in self.reading_list:
             if existing.url == url:
@@ -189,7 +332,7 @@ class Reader:
         return entry
 
     def add_text(self, text: str, title: str = "Manual text",
-                 priority: float = 0.7) -> ReadingEntry:
+                 priority: float = 0.7) -> AbsorptionResult:
         """Add raw text directly to be absorbed."""
         entry = ReadingEntry(
             url=f"text://{uuid.uuid4()}", title=title,
@@ -255,28 +398,108 @@ class Reader:
             return "", f"Error fetching URL: {e}"
 
     def _fetch_arxiv(self, arxiv_id_or_url: str) -> tuple:
-        """Fetch arXiv abstract."""
+        """Fetch arXiv abstract text for a specific paper."""
+        metadata, error = self._fetch_arxiv_metadata(arxiv_id_or_url)
+        if metadata is None:
+            return "", error
+        return metadata.get("title", ""), metadata.get("abstract", "")[:MAX_TEXT_CHARS]
+
+    def _fetch_pdf_text(self, pdf_path_or_url: str) -> tuple:
+        """Fetch and parse PDF text from URL or local path."""
+        if not pdf_path_or_url:
+            return "", "Error: Empty PDF URL/path"
+
         try:
-            import re
-            arxiv_id = re.findall(r'\d{4}\.\d{4,5}', arxiv_id_or_url)
-            if not arxiv_id:
-                return "", "Could not extract arXiv ID"
-            aid = arxiv_id[0]
-            import xml.etree.ElementTree as ET
-            resp = requests.get(
-                f"http://export.arxiv.org/api/query?id_list={aid}",
-                timeout=15)
-            root = ET.fromstring(resp.content)
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            for entry in root.findall("atom:entry", ns):
-                title   = entry.find("atom:title", ns)
-                summary = entry.find("atom:summary", ns)
-                t = title.text.strip() if title is not None else aid
-                s = summary.text.strip() if summary is not None else ""
-                return t, s[:MAX_TEXT_CHARS]
-            return aid, ""
+            if pdf_path_or_url.startswith(("http://", "https://")):
+                resp = requests.get(
+                    pdf_path_or_url,
+                    timeout=25,
+                    headers={"User-Agent": "DREAMER/1.0"},
+                )
+                resp.raise_for_status()
+                pdf_bytes = resp.content
+                name_hint = pdf_path_or_url.split("?")[0].rstrip("/").split("/")[-1]
+            else:
+                local_path = pdf_path_or_url
+                if local_path.startswith("file://"):
+                    local_path = local_path[7:]
+                with open(local_path, "rb") as f:
+                    pdf_bytes = f.read()
+                name_hint = os.path.basename(local_path)
+
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                return "", "Error: pypdf is required for PDF ingestion"
+
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            pages = []
+            for page in reader.pages:
+                page_text = (page.extract_text() or "").strip()
+                if page_text:
+                    pages.append(page_text)
+
+            full_text = "\n\n".join(pages).strip()
+            if not full_text:
+                return "", "Error: PDF parsed but no extractable text was found"
+
+            title = ""
+            metadata = getattr(reader, "metadata", None)
+            if metadata is not None:
+                try:
+                    title = (getattr(metadata, "title", None) or "").strip()
+                except Exception:
+                    title = ""
+                if not title and isinstance(metadata, dict):
+                    title = str(metadata.get("/Title", "") or "").strip()
+
+            if not title:
+                title = os.path.splitext(name_hint or "PDF document")[0] or "PDF document"
+
+            return title, full_text[:MAX_PDF_TEXT_CHARS]
         except Exception as e:
-            return "", f"Error fetching arXiv: {e}"
+            return "", f"Error parsing PDF: {e}"
+
+    def _segment_document_sections(self, text: str) -> list[dict]:
+        """Split long paper-like text into section chunks for ingestion."""
+        if not text or not text.strip():
+            return []
+
+        sections = []
+        current_label = "document_overview"
+        current_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if SECTION_HEADING_RE.match(line):
+                if current_lines:
+                    section_text = "\n".join(current_lines).strip()
+                    if section_text:
+                        sections.append({"label": current_label, "text": section_text})
+                current_label = line[:120]
+                current_lines = []
+                continue
+
+            current_lines.append(line)
+
+        if current_lines:
+            section_text = "\n".join(current_lines).strip()
+            if section_text:
+                sections.append({"label": current_label, "text": section_text})
+
+        if len(sections) <= 1:
+            paragraphs = [
+                p.strip() for p in re.split(r"\n\s*\n", text)
+                if len(p.strip()) >= MIN_SECTION_CHARS
+            ]
+            sections = [
+                {"label": f"section_{i + 1}", "text": p}
+                for i, p in enumerate(paragraphs[:24])
+            ]
+
+        return sections
 
     def _clean_html(self, html: str) -> str:
         """Strip HTML tags."""
@@ -284,6 +507,144 @@ class Reader:
         text = re.sub(r'<[^>]+>', ' ', html)
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
+
+    def _build_expectation(self, entry: ReadingEntry) -> str:
+        mission = self.brain.get_mission()
+        mission_text = mission['question'] if mission else "None"
+        clusters = list(set(
+            d.get('cluster', 'unknown')
+            for _, d in self.brain.all_nodes()
+            if d.get('cluster') != 'unclustered'
+        ))[:10]
+        return self._llm(EXPECTATION_PROMPT.format(
+            title=entry.title,
+            url=entry.url,
+            mission=mission_text,
+            clusters=", ".join(clusters)
+        ), temperature=0.6)
+
+    def _make_section_ref(self, source_ref: str, label: str, idx: int) -> str:
+        base = (source_ref or "section://unknown").strip()
+        safe_label = urllib.parse.quote(
+            (label or f"section_{idx}").strip().lower().replace(" ", "_")[:80],
+            safe="",
+        )
+        if "#" in base:
+            base = base.split("#", 1)[0]
+        return f"{base}#section={safe_label or f'section_{idx}'}"
+
+    def _node_summaries(self, node_ids: list[str], limit: int = 8) -> str:
+        return "\n".join(
+            f"- {self.brain.get_node(nid)['statement']}"
+            for nid in node_ids[:limit]
+            if self.brain.get_node(nid)
+        ) or "No new nodes extracted."
+
+    def _absorb_sections(self, sections: list[dict], entry: ReadingEntry,
+                         title_override: str = "") -> AbsorptionResult:
+        """Absorb sectioned text by ingesting each section independently."""
+        valid_sections = []
+        for idx, section in enumerate(sections, start=1):
+            label = str(section.get("label", f"section_{idx}")).strip() or f"section_{idx}"
+            section_text = str(section.get("text", "")).strip()
+            if len(section_text) < MIN_SECTION_CHARS:
+                continue
+            valid_sections.append((idx, label, section_text))
+
+        if not valid_sections:
+            fallback_text = "\n\n".join(
+                str(section.get("text", ""))
+                for section in sections
+                if section.get("text")
+            )
+            return self._absorb_text(fallback_text[:MAX_PDF_TEXT_CHARS], entry)
+
+        if title_override:
+            entry.title = title_override
+
+        prediction = self._build_expectation(entry)
+        print(f"  [Predictive Processing] Expectation: {prediction[:80]}...")
+
+        section_payloads = []
+        for idx, label, section_text in valid_sections:
+            section_ref = self._make_section_ref(entry.url, label, idx)
+            source_node_id = self.brain.create_source_node(
+                title=f"{entry.title} — {label}",
+                reference=section_ref,
+                source_type=f"{entry.source_type}_section",
+                created_by="reader",
+                excerpt=section_text[:800],
+            )
+
+            section_payloads.append({
+                "label": label,
+                "text": section_text,
+                "source_ids": [source_node_id],
+                "source_refs": [section_ref],
+            })
+
+        if hasattr(self.ingestor, "ingest_sections"):
+            created_node_ids = self.ingestor.ingest_sections(
+                section_payloads,
+                source=EdgeSource.READING,
+                prediction=prediction,
+                created_by="reader",
+            ) or []
+        else:
+            created_node_ids = []
+            for payload in section_payloads:
+                section_node_ids = self.ingestor.ingest(
+                    payload["text"],
+                    source=EdgeSource.READING,
+                    prediction=prediction,
+                    source_ids=payload["source_ids"],
+                    source_refs=payload["source_refs"],
+                    created_by="reader",
+                ) or []
+                created_node_ids.extend(section_node_ids)
+
+        unique_node_ids = list(dict.fromkeys(created_node_ids))
+        node_count = len(unique_node_ids)
+
+        entry.node_count = node_count
+        entry.section_count = len(valid_sections)
+        entry.section_labels = [label for _, label, _ in valid_sections]
+        entry.status = 'read'
+        entry.absorbed_at = time.time()
+        self._save_list()
+
+        summary = self._llm(ABSORPTION_SUMMARY_PROMPT.format(
+            title=entry.title,
+            source=entry.url,
+            node_count=node_count,
+            node_summaries=self._node_summaries(unique_node_ids),
+        ))
+
+        if self.notebook:
+            self.notebook._add_entry(
+                "reading", summary, 0,
+                tags=[
+                    f"source:{entry.source_type}",
+                    f"nodes:{node_count}",
+                    f"sections:{entry.section_count}",
+                    entry.title,
+                ]
+            )
+
+        text_length = sum(len(text) for _, _, text in valid_sections)
+        print(
+            f"  Absorbed by section: {entry.title} — "
+            f"{entry.section_count} sections, {node_count} new nodes"
+        )
+        return AbsorptionResult(
+            entry=entry,
+            title=entry.title,
+            text_length=text_length,
+            node_count=node_count,
+            node_ids=unique_node_ids,
+            summary=summary,
+            success=True,
+        )
 
     # ── Absorption ────────────────────────────────────────────────────────────
 
@@ -298,26 +659,28 @@ class Reader:
                 success=False, error="Text too short"
             )
 
-        nodes_before = len(self.brain.graph.nodes)
+        prediction = self._build_expectation(entry)
 
-        # generate expectation (predictive processing)
-        mission = self.brain.get_mission()
-        mission_text = mission['question'] if mission else "None"
-        clusters = list(set(d.get('cluster', 'unknown') for _, d in self.brain.all_nodes() if d.get('cluster') != 'unclustered'))[:10]
-        
-        prediction = self._llm(EXPECTATION_PROMPT.format(
-            title=entry.title,
-            url=entry.url,
-            mission=mission_text,
-            clusters=", ".join(clusters)
-        ), temperature=0.6)
-        
         print(f"  [Predictive Processing] Expectation: {prediction[:80]}...")
 
-        # absorb with READING source — pass prediction down
-        created_node_ids = self.ingestor.ingest(text, source=EdgeSource.READING, prediction=prediction) or []
+        source_node_id = self.brain.create_source_node(
+            title=entry.title,
+            reference=entry.url,
+            source_type=entry.source_type,
+            created_by="reader",
+            excerpt=text[:800],
+        )
 
-        nodes_after  = len(self.brain.graph.nodes)
+        # absorb with READING source — pass prediction down
+        created_node_ids = self.ingestor.ingest(
+            text,
+            source=EdgeSource.READING,
+            prediction=prediction,
+            source_ids=[source_node_id],
+            source_refs=[entry.url],
+            created_by="reader",
+        ) or []
+
         node_count   = len(created_node_ids)
         entry.node_count  = node_count
         entry.status      = 'read'
@@ -326,11 +689,7 @@ class Reader:
 
         # get summaries of new nodes for the reading log
         new_node_ids = created_node_ids
-        node_summaries = "\n".join(
-            f"- {self.brain.get_node(nid)['statement']}"
-            for nid in new_node_ids[:8]
-            if self.brain.get_node(nid)
-        ) or "No new nodes extracted."
+        node_summaries = self._node_summaries(new_node_ids)
 
         # write reading log entry
         summary = self._llm(ABSORPTION_SUMMARY_PROMPT.format(
@@ -359,18 +718,72 @@ class Reader:
     def absorb_entry(self, entry: ReadingEntry) -> AbsorptionResult:
         """Fetch and absorb a reading list entry."""
         entry.status = 'reading'
+        entry.source_type = self._normalize_source_type(entry.source_type)
         self._save_list()
         print(f"\n── Reader: absorbing '{entry.title}' ──")
 
         text  = ""
         title = entry.title
 
+        if entry.source_type == "arxiv_query":
+            resolved, resolve_error = self._resolve_arxiv_query(entry.url or entry.title)
+            if not resolved:
+                entry.status = 'failed'
+                self._save_list()
+                return AbsorptionResult(
+                    entry=entry,
+                    title=title,
+                    text_length=0,
+                    node_count=0,
+                    node_ids=[],
+                    summary="",
+                    success=False,
+                    error=resolve_error,
+                )
+
+            entry.resolved_from_query = resolved.get("query", entry.url)
+            entry.resolved_arxiv_id = resolved.get("arxiv_id", "")
+            entry.resolved_pdf_url = resolved.get("pdf_url", "")
+            entry.source_type = "arxiv_paper"
+            entry.url = resolved.get("abs_url", entry.url)
+            if resolved.get("title"):
+                entry.title = resolved["title"]
+                title = entry.title
+            print(f"  Resolved arXiv query to paper: {entry.resolved_arxiv_id or entry.url}")
+            self._save_list()
+
         if entry.source_type == "text":
             text = entry.raw_text or entry.added_reason
         elif entry.source_type == "wikipedia":
             title, text = self._fetch_wikipedia(entry.url)
-        elif entry.source_type == "arxiv":
+        elif entry.source_type == "arxiv_paper":
             title, text = self._fetch_arxiv(entry.url)
+            pdf_url = entry.resolved_pdf_url or self._arxiv_pdf_url(entry.url)
+            if pdf_url:
+                pdf_title, pdf_text = self._fetch_pdf_text(pdf_url)
+                if pdf_text and not pdf_text.startswith("Error"):
+                    entry.resolved_pdf_url = pdf_url
+                    if pdf_title:
+                        title = pdf_title
+                    sections = self._segment_document_sections(pdf_text)
+                    if sections:
+                        if title:
+                            entry.title = title
+                        return self._absorb_sections(sections, entry, title_override=title)
+                    text = pdf_text
+                elif not text:
+                    text = pdf_text
+        elif entry.source_type == "pdf":
+            title, pdf_text = self._fetch_pdf_text(entry.url)
+            if pdf_text and not pdf_text.startswith("Error"):
+                sections = self._segment_document_sections(pdf_text)
+                if sections:
+                    if title:
+                        entry.title = title
+                    return self._absorb_sections(sections, entry, title_override=title)
+                text = pdf_text
+            else:
+                text = pdf_text
         else:
             title, text = self._fetch_web(entry.url)
 
@@ -385,6 +798,9 @@ class Reader:
                 node_count=0, node_ids=[], summary="", success=False,
                 error=text or "Empty response"
             )
+
+        entry.section_count = 0
+        entry.section_labels = []
 
         return self._absorb_text(text, entry)
 
@@ -466,7 +882,7 @@ class Reader:
         for s in suggestions:
             url    = s.get('url', '')
             title  = s.get('title', '')
-            stype  = s.get('source_type', 'web')
+            stype  = self._normalize_source_type(s.get('source_type', 'web'))
             reason = s.get('reason', '')
             if url:
                 entry = self.add_to_list(

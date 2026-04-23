@@ -1,9 +1,0 @@
-{
-  "question|unclustered": {
-    "analogical": 0.5,
-    "dialectical": 0.5,
-    "reductive": 0.5,
-    "experimental": 0.5,
-    "integrative": 0.5
-  }
-}

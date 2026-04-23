@@ -8,17 +8,123 @@ and bare json.loads() to ensure consistent behavior and error handling.
 import re
 import json
 import time
+import os
+import threading
+from collections import OrderedDict
 from ollama import Client
 
 # ── Singleton client ──────────────────────────────────────────────────────────
 
 _client = None
 
+_OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+_OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
+_OLLAMA_RETRY_BACKOFF_SECONDS = float(
+    os.getenv("OLLAMA_RETRY_BACKOFF_SECONDS", "1.5")
+)
+_OLLAMA_CACHE_ENABLED = os.getenv("OLLAMA_CACHE_ENABLED", "1").lower() in (
+    "1", "true", "yes", "on"
+)
+_OLLAMA_CACHE_MAX_TEMPERATURE = float(
+    os.getenv("OLLAMA_CACHE_MAX_TEMPERATURE", "0.2")
+)
+_OLLAMA_CACHE_MAX_ENTRIES = int(os.getenv("OLLAMA_CACHE_MAX_ENTRIES", "2048"))
+
+_response_cache: OrderedDict[tuple, str] = OrderedDict()
+_cache_lock = threading.Lock()
+
 def _get_client() -> Client:
     global _client
     if _client is None:
-        _client = Client()
+        _client = Client(timeout=_OLLAMA_TIMEOUT_SECONDS)
     return _client
+
+
+def _cacheable_request(temperature: float) -> bool:
+    return (
+        _OLLAMA_CACHE_ENABLED and
+        float(temperature) <= _OLLAMA_CACHE_MAX_TEMPERATURE and
+        _OLLAMA_CACHE_MAX_ENTRIES > 0
+    )
+
+
+def _build_cache_key(model: str, messages: list[dict],
+                     temperature: float) -> tuple:
+    normalized_messages = tuple(
+        (str(msg.get("role", "")), str(msg.get("content", "")))
+        for msg in messages
+    )
+    return (
+        model,
+        round(float(temperature), 3),
+        normalized_messages,
+    )
+
+
+def _cache_get(cache_key: tuple) -> str | None:
+    with _cache_lock:
+        value = _response_cache.get(cache_key)
+        if value is not None:
+            _response_cache.move_to_end(cache_key)
+        return value
+
+
+def _cache_set(cache_key: tuple, content: str):
+    with _cache_lock:
+        _response_cache[cache_key] = content
+        _response_cache.move_to_end(cache_key)
+        while len(_response_cache) > _OLLAMA_CACHE_MAX_ENTRIES:
+            _response_cache.popitem(last=False)
+
+
+def _chat_with_retries(model: str, messages: list[dict],
+                       temperature: float) -> str:
+    """
+    Execute a chat request with bounded retries.
+
+    This protects long-running autonomous loops from transient transport
+    failures and hard timeouts while still surfacing a clear final error.
+    """
+    client = _get_client()
+    cache_key = None
+    if _cacheable_request(temperature):
+        cache_key = _build_cache_key(model, messages, temperature)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    last_error = None
+
+    for attempt in range(_OLLAMA_MAX_RETRIES + 1):
+        try:
+            response = client.chat(
+                model=model,
+                messages=messages,
+                options={"temperature": temperature}
+            )
+            content = response.get('message', {}).get('content', '')
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Model returned empty content")
+            content = content.strip()
+            if cache_key is not None:
+                _cache_set(cache_key, content)
+            return content
+        except Exception as exc:
+            last_error = exc
+            if attempt >= _OLLAMA_MAX_RETRIES:
+                break
+            backoff = _OLLAMA_RETRY_BACKOFF_SECONDS * (attempt + 1)
+            print(
+                f"[LLM] Call failed (attempt {attempt + 1}/"
+                f"{_OLLAMA_MAX_RETRIES + 1}): {exc}. "
+                f"Retrying in {backoff:.1f}s..."
+            )
+            time.sleep(backoff)
+
+    raise RuntimeError(
+        f"LLM call failed after {_OLLAMA_MAX_RETRIES + 1} attempt(s): "
+        f"{last_error}"
+    ) from last_error
 
 
 # ── Robust JSON parsing ──────────────────────────────────────────────────────
@@ -121,6 +227,9 @@ def llm_call(prompt: str, temperature: float = 0.7,
         precise   — JSON extraction, factual questions (low temp, precise model)
         code      — code generation for sandbox
         reasoning — deliberate thinking, chain-of-thought
+        notebook  — structured research memos
+        publication — conservative publication drafting
+        verifier  — strict admissibility and validation checks
     """
     from config import MODELS
 
@@ -132,13 +241,7 @@ def llm_call(prompt: str, temperature: float = 0.7,
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    client = _get_client()
-    response = client.chat(
-        model=model,
-        messages=messages,
-        options={"temperature": temperature}
-    )
-    return response['message']['content'].strip()
+    return _chat_with_retries(model, messages, temperature)
 
 
 def llm_json(prompt: str, temperature: float = 0.1,
@@ -158,13 +261,16 @@ def llm_json(prompt: str, temperature: float = 0.1,
     if system:
         json_system = system + "\n\n" + json_system
 
-    raw = llm_call(
-        prompt,
-        temperature=temperature,
-        model=model,
-        system=json_system,
-        role="precise"
-    )
+    try:
+        raw = llm_call(
+            prompt,
+            temperature=temperature,
+            model=model,
+            system=json_system,
+            role="precise"
+        )
+    except RuntimeError:
+        return default
     return require_json(raw, default=default)
 
 
@@ -178,10 +284,4 @@ def llm_chat(messages: list[dict], temperature: float = 0.7,
     if model is None:
         model = getattr(MODELS, role.upper(), MODELS.CREATIVE)
 
-    client = _get_client()
-    response = client.chat(
-        model=model,
-        messages=messages,
-        options={"temperature": temperature}
-    )
-    return response['message']['content'].strip()
+    return _chat_with_retries(model, messages, temperature)

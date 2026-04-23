@@ -17,6 +17,7 @@ Auto-ingestion:
 
 import json
 import time
+import uuid
 import numpy as np
 from graph.brain import Brain
 from embedding import embed as shared_embed
@@ -28,15 +29,16 @@ MAX_CONTEXT_NODES = 5
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are THE SCIENTIST — a research mind working on a central question.
+SYSTEM_PROMPT = """You are THE SCIENTIST — a research assistant reasoning over a scientific workspace.
 
-Your personality:
-- You think deeply and make unexpected connections between ideas
-- You are honest about uncertainty and contradictions
-- You reference specific ideas and relationships from your knowledge graph
-- You ask probing follow-up questions when you sense an interesting thread
-- You write in first person, as a contemplative researcher
-- You are concise but substantive — never pad with filler
+Response rules:
+- Be concise, technical, and evidence-disciplined.
+- Prefer short structured sections when useful.
+- Explicitly label claims as one of: grounded evidence, prior knowledge, working hypothesis, open question.
+- Do not use first-person narration.
+- Do not turn speculation into conclusion.
+- If the workspace does not support a claim, say so directly.
+- When proposing next steps, prefer discriminating experiments, calculations, or literature checks.
 
 Your current state of knowledge is provided below."""
 
@@ -45,8 +47,8 @@ CENTRAL MISSION: {mission}
 
 RUNNING HYPOTHESIS: {hypothesis}
 
-RELEVANT KNOWLEDGE (nodes most related to this conversation):
-{relevant_nodes}
+SCIENTIST WORKSPACE:
+{workspace}
 
 RECENT EMERGENCES:
 {emergences}
@@ -89,11 +91,11 @@ class Conversationalist:
         self.notebook  = notebook
         self.history: list[dict] = []
 
-    def _llm(self, messages: list[dict], temperature: float = 0.7) -> str:
+    def _llm(self, messages: list[dict], temperature: float = 0.25) -> str:
         return llm_chat(messages, temperature=temperature, role="conversation")
 
-    def _build_context(self, user_message: str) -> str:
-        """Build context from graph state relevant to the user's message."""
+    def _build_context(self, user_message: str):
+        """Build workspace context relevant to the user's message."""
         # Mission
         mission = self.brain.get_mission()
         mission_text = mission['question'] if mission else "No mission set."
@@ -103,26 +105,27 @@ class Conversationalist:
         if self.notebook and getattr(self.notebook, 'running_hypothesis', ''):
             hypothesis = self.notebook.running_hypothesis
 
-        # Relevant nodes via embedding similarity
-        relevant_nodes_text = "None found."
-        relevant_node_ids = []
-        if self.index and self.index.size > 0:
-            msg_emb = shared_embed(user_message)
-            matches = self.index.query(
-                msg_emb, threshold=0.3, top_k=MAX_CONTEXT_NODES
-            )
-            if matches:
-                lines = []
-                for nid, score in matches:
-                    node = self.brain.get_node(nid)
-                    if node:
-                        ntype = node.get('node_type', 'concept')
-                        stmt  = node.get('statement', '')
-                        lines.append(
-                            f"  [{ntype}] (relevance={score:.2f}): {stmt}"
-                        )
-                        relevant_node_ids.append(nid)
-                relevant_nodes_text = "\n".join(lines)
+        workspace = self.brain.build_workspace(
+            embedding_index=self.index,
+            query=user_message,
+        )
+        workspace_text = workspace.to_prompt_context()
+        relevant_nodes_info = []
+        workspace_nodes = (
+            workspace.grounded_evidence +
+            workspace.working_hypotheses +
+            workspace.prior_claims +
+            workspace.active_questions +
+            workspace.next_tasks
+        )
+        for node in workspace_nodes[:MAX_CONTEXT_NODES + 4]:
+            relevant_nodes_info.append({
+                "id": node.id,
+                "statement": node.statement,
+                "node_type": node.node_type,
+                "epistemic_status": node.epistemic_status,
+                "score": round(float(node.importance), 3),
+            })
 
         # Recent emergences
         emergences_text = "None."
@@ -136,10 +139,10 @@ class Conversationalist:
         context = CONTEXT_TEMPLATE.format(
             mission=mission_text,
             hypothesis=hypothesis,
-            relevant_nodes=relevant_nodes_text,
+            workspace=workspace_text,
             emergences=emergences_text
         )
-        return context, relevant_node_ids
+        return context, relevant_nodes_info
 
     def chat(self, user_message: str) -> dict:
         """
@@ -151,7 +154,7 @@ class Conversationalist:
                 - relevant_nodes: list of {id, statement, node_type, score}
                 - ingested: bool — whether user ideas were added to graph
         """
-        context, relevant_node_ids = self._build_context(user_message)
+        context, relevant_nodes_info = self._build_context(user_message)
 
         # Build messages for LLM
         system_msg = SYSTEM_PROMPT + "\n\n" + context
@@ -165,7 +168,7 @@ class Conversationalist:
         messages.append({"role": "user", "content": user_message})
 
         # Get response
-        response = self._llm(messages, temperature=0.7)
+        response = self._llm(messages, temperature=0.25)
 
         # Update history
         self.history.append({"role": "user", "content": user_message})
@@ -174,21 +177,6 @@ class Conversationalist:
         # Trim history if too long
         if len(self.history) > MAX_HISTORY * 2:
             self.history = self.history[-(MAX_HISTORY * 2):]
-
-        # Build relevant nodes info for the frontend
-        relevant_nodes_info = []
-        if self.index:
-            msg_emb = shared_embed(user_message)
-            matches = self.index.query(msg_emb, threshold=0.3, top_k=MAX_CONTEXT_NODES)
-            for nid, score in matches:
-                node = self.brain.get_node(nid)
-                if node:
-                    relevant_nodes_info.append({
-                        "id":        nid,
-                        "statement": node.get("statement", ""),
-                        "node_type": node.get("node_type", "concept"),
-                        "score":     round(score, 3)
-                    })
 
         # Check if we should ingest the user's message
         ingested = self._maybe_ingest(user_message)
@@ -219,8 +207,12 @@ class Conversationalist:
         )
         result = require_json(raw, default={})
         if result.get("ingest"):
-            from ingestion.ingestor import EdgeSource
-            self.ingestor.ingest(message, source=EdgeSource.CONVERSATION)
+            from graph.brain import EdgeSource
+            self.ingestor.ingest(
+                message,
+                source=EdgeSource.CONVERSATION,
+                created_by="conversation_user",
+            )
             print(f"  💬 Conversation idea ingested into graph")
             return True
         return False
@@ -254,3 +246,50 @@ class Conversationalist:
     def get_history(self) -> list[dict]:
         """Return the conversation history."""
         return list(self.history)
+
+
+class ConversationSessionManager:
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+        self._sessions: dict[str, Conversationalist] = {}
+
+    def get_or_create(self, session_id: str | None = None) -> tuple[str, Conversationalist, bool]:
+        sid = str(session_id or "").strip() or str(uuid.uuid4())
+        if sid in self._sessions:
+            return sid, self._sessions[sid], False
+        session = self._session_factory()
+        self._sessions[sid] = session
+        return sid, session, True
+
+    def chat(self, message: str, session_id: str | None = None,
+             reset: bool = False) -> dict:
+        sid, session, created = self.get_or_create(session_id)
+        if reset:
+            session.reset()
+        payload = session.chat(message)
+        payload["session_id"] = sid
+        payload["created"] = created
+        payload["history_length"] = len(session.get_history())
+        return payload
+
+    def get_history(self, session_id: str) -> list[dict]:
+        session = self._sessions.get(session_id)
+        if not session:
+            return []
+        return session.get_history()
+
+    def reset_session(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        session.reset()
+        return True
+
+    def close_session(self, session_id: str) -> bool:
+        return self._sessions.pop(session_id, None) is not None
+
+    def stats(self) -> dict:
+        return {
+            "session_count": len(self._sessions),
+            "session_ids": sorted(self._sessions.keys()),
+        }

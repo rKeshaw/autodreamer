@@ -290,10 +290,21 @@ class InsightBuffer:
             # Compute current similarity
             current_sim = max(self._current_similarity(pair), pair.original_similarity)
 
-            # Count shared neighbors as context boost
+            # Count shared graph context as boost
             shared = self._shared_neighbor_count(pair)
-            context_score = current_sim + (shared * NEIGHBOR_BOOST)
-            if pair.claim and shared:
+            similarity_gain = max(0.0, current_sim - pair.original_similarity)
+            same_cluster = (
+                node_a.get('cluster') and
+                node_a.get('cluster') == node_b.get('cluster') and
+                node_a.get('cluster') != 'unclustered'
+            )
+            context_score = (
+                current_sim +
+                (shared * NEIGHBOR_BOOST) +
+                (0.40 * similarity_gain) +
+                (0.03 if same_cluster else 0.0)
+            )
+            if pair.claim and (shared > 0 or similarity_gain >= 0.05):
                 context_score += PROMOTION_BOOST
 
             pair.times_evaluated += 1
@@ -301,7 +312,10 @@ class InsightBuffer:
             pair.best_score = max(pair.best_score, context_score)
 
             # If context score now exceeds threshold → LLM evaluation
-            if context_score >= THRESHOLDS.WEAK_EDGE:
+            # Keep this gate slightly below WEAK_EDGE so near-threshold pairs
+            # can still be reviewed when graph context improves.
+            promotion_gate = max(BUFFER_LOW + 0.05, THRESHOLDS.WEAK_EDGE - 0.08)
+            if context_score >= promotion_gate or similarity_gain >= 0.10:
                 result = self._llm_evaluate(pair, node_a, node_b)
                 if result and result.get("connected"):
                     self._promote(pair, result)
@@ -348,19 +362,43 @@ class InsightBuffer:
 
         return pair.original_similarity
 
-    def _shared_neighbor_count(self, pair: PendingInsight) -> int:
-        """Count how many nodes are neighbors of BOTH A and B."""
+    def _undirected_neighbors(self, node_id: str) -> set[str]:
+        """Return combined in/out neighborhood for structural overlap checks."""
         try:
-            neighbors_a = set(self.brain.graph.neighbors(pair.node_a_id))
-            neighbors_b = set(self.brain.graph.neighbors(pair.node_b_id))
-            return len(neighbors_a & neighbors_b)
+            out_neighbors = set(self.brain.graph.successors(node_id))
+            in_neighbors = set(self.brain.graph.predecessors(node_id))
+            return out_neighbors | in_neighbors
+        except Exception:
+            return set()
+
+    def _shared_neighbor_count(self, pair: PendingInsight) -> int:
+        """Count direct and second-order shared context between A and B."""
+        try:
+            neighbors_a = self._undirected_neighbors(pair.node_a_id)
+            neighbors_b = self._undirected_neighbors(pair.node_b_id)
+            direct_overlap = len(neighbors_a & neighbors_b)
+
+            if direct_overlap > 0:
+                return direct_overlap
+
+            # Second-order overlap captures delayed context convergence even
+            # when direct shared neighbors are not yet present.
+            second_a = set()
+            second_b = set()
+            for nid in list(neighbors_a)[:20]:
+                second_a |= self._undirected_neighbors(nid)
+            for nid in list(neighbors_b)[:20]:
+                second_b |= self._undirected_neighbors(nid)
+
+            second_overlap = len(second_a & second_b)
+            return int(round(second_overlap * 0.5))
         except Exception:
             return 0
 
     def _get_neighbor_summaries(self, node_id: str, max_n: int = 5) -> str:
         """Get brief summaries of a node's neighbors for LLM context."""
         try:
-            neighbors = list(self.brain.graph.neighbors(node_id))[:max_n]
+            neighbors = list(self._undirected_neighbors(node_id))[:max_n]
             summaries = []
             for nid in neighbors:
                 node = self.brain.get_node(nid)
@@ -462,4 +500,26 @@ class InsightBuffer:
                 (time.time() - min(p.first_seen for p in self.pending)) / 86400
                 if self.pending else 0
             )
+        }
+
+    # ── Reference cleanup ───────────────────────────────────────────────────
+
+    def remove_node_references(self, removed_node_ids: list[str] | set[str]) -> dict:
+        """Drop pending pair insights that reference pruned graph nodes."""
+        removed = set(removed_node_ids or [])
+        if not removed:
+            return {"cleaned": 0, "remaining": len(self.pending)}
+
+        before = len(self.pending)
+        self.pending = [
+            pair for pair in self.pending
+            if pair.is_node or (pair.node_a_id not in removed and pair.node_b_id not in removed)
+        ]
+        cleaned = max(0, before - len(self.pending))
+        if cleaned:
+            self.save()
+
+        return {
+            "cleaned": cleaned,
+            "remaining": len(self.pending),
         }

@@ -7,6 +7,7 @@ from typing import Optional
 from enum import Enum
 from persistence import atomic_write_json
 from graph.episodic import EpisodicStrip
+from scientist_workspace import ArtifactStatus, ScientistWorkspace, WorkspaceNode
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
@@ -17,6 +18,8 @@ class BrainMode(str, Enum):
 
 class NodeType(str, Enum):
     CONCEPT      = "concept"
+    SOURCE       = "source"
+    EVIDENCE_CLAIM = "evidence_claim"
     QUESTION     = "question"
     HYPOTHESIS   = "hypothesis"
     ANSWER       = "answer"
@@ -24,12 +27,15 @@ class NodeType(str, Enum):
     GAP          = "gap"
     MISSION      = "mission"
     EMPIRICAL    = "empirical"
+    TASK         = "task"
 
 class NodeStatus(str, Enum):
-    SETTLED      = "settled"
-    UNCERTAIN    = "uncertain"
-    CONTRADICTED = "contradicted"
-    HYPOTHETICAL = "hypothetical"
+    SETTLED        = "settled"
+    UNCERTAIN      = "uncertain"
+    CONTRADICTED   = "contradicted"
+    HYPOTHETICAL   = "hypothetical"
+    LACKS_EVIDENCE = "lacks_evidence"  # searched but found nothing either way
+    TESTING        = "testing"         # currently being researched
 
 class EdgeType(str, Enum):
     SUPPORTS           = "supports"
@@ -44,6 +50,10 @@ class EdgeType(str, Enum):
     PARTIAL            = "partial"
     TOWARD_MISSION     = "toward_mission"
     EMPIRICALLY_TESTED = "empirically_tested"
+    CORRECTED_BY       = "corrected_by"     # evidence that disproved a hypothesis
+    TESTS              = "tests"            # thinker query → hypothesis link
+    DERIVED_FROM       = "derived_from"     # hypothesis → seed claim nodes
+    CONFIRMED_BY       = "confirmed_by"     # evidence that supports hypothesis
 
 class EdgeSource(str, Enum):
     CONVERSATION  = "conversation"
@@ -68,6 +78,7 @@ class Node:
     node_type: NodeType    = NodeType.CONCEPT
     cluster: str           = "unclustered"
     status: NodeStatus     = NodeStatus.UNCERTAIN
+    epistemic_status: str  = ArtifactStatus.OPEN.value
     importance: float      = 0.5
     created_at: float      = field(default_factory=time.time)
     activated_at: float    = field(default_factory=time.time)
@@ -78,10 +89,20 @@ class Node:
     first_queued_cycle: int= 0
     empirical_result: str  = ""
     empirical_code: str    = ""
+    empirical_metrics: dict = field(default_factory=dict)
+    experiment_artifacts: dict = field(default_factory=dict)
     # ── Confidence tracking ──
     source_quality: float      = 0.5   # 1.0=primary source, 0.5=synthesis, 0.3=dream
     verification_count: int    = 0     # how many times reinforced from independent sources
     last_verified: float       = 0.0   # timestamp of last reinforcement
+    source_ids: list[str]      = field(default_factory=list)
+    source_refs: list[str]     = field(default_factory=list)
+    provenance_spans: list[dict] = field(default_factory=list)
+    extraction_confidence: float = 0.0
+    created_by: str            = ""
+    mission_relevance: float   = 0.0
+    source_type: str           = ""
+    source_excerpt: str        = ""
 
     def touch(self):
         self.activated_at = time.time()
@@ -102,6 +123,7 @@ class Edge:
     updated_at: float      = field(default_factory=time.time)
     decay_exempt: bool     = False
     analogy_depth: str     = ""
+    matcher_report: dict   = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -109,7 +131,8 @@ class Edge:
 # ── Brain ─────────────────────────────────────────────────────────────────────
 
 class Brain:
-    MAX_WORKING_MEMORY = 10   # top items under active investigation
+    MAX_WORKING_MEMORY = 10        # top items under active investigation
+    MAX_ACTIVE_HYPOTHESES = 15     # max unresolved hypothesis nodes in the graph
 
     def __init__(self, decay_rate: float = 0.01, scientificness: float = 0.7):
         self.graph           = nx.DiGraph()
@@ -164,6 +187,7 @@ class Brain:
             node_type        = NodeType.MISSION,
             cluster          = "mission",
             status           = NodeStatus.UNCERTAIN,
+            epistemic_status = ArtifactStatus.OPEN.value,
             importance       = 1.0,
             predicted_answer = context
         )
@@ -239,11 +263,207 @@ class Brain:
     def all_nodes(self) -> list:
         return list(self.graph.nodes(data=True))
 
-    def nodes_by_type(self, node_type: NodeType) -> list:
+    def nodes_by_type(self, node_type: NodeType | str) -> list:
+        if isinstance(node_type, NodeType):
+            node_type_value = node_type.value
+        else:
+            node_type_value = str(node_type).strip().lower()
         return [
             (nid, data) for nid, data in self.graph.nodes(data=True)
-            if data.get('node_type') == node_type.value
+            if data.get('node_type') == node_type_value
         ]
+
+    # ── Hypothesis throttle ──────────────────────────────────────────────────
+
+    def count_active_hypotheses(self) -> int:
+        """Count hypothesis nodes that are not yet resolved (settled or contradicted)."""
+        return sum(
+            1 for _, data in self.graph.nodes(data=True)
+            if data.get('node_type') == NodeType.HYPOTHESIS.value
+            and data.get('status') not in (
+                NodeStatus.SETTLED.value,
+                NodeStatus.CONTRADICTED.value,
+            )
+        )
+
+    def can_spawn_hypothesis(self) -> bool:
+        """Check if the graph has room for more active hypotheses."""
+        return self.count_active_hypotheses() < self.MAX_ACTIVE_HYPOTHESES
+
+    def nodes_by_epistemic_status(self, epistemic_status: str) -> list:
+        return [
+            (nid, data) for nid, data in self.graph.nodes(data=True)
+            if data.get('epistemic_status') == epistemic_status
+        ]
+
+    def create_source_node(self, title: str, reference: str,
+                           source_type: str = "web",
+                           created_by: str = "system",
+                           excerpt: str = "") -> str:
+        statement = (title or reference or "source").strip()
+        node = Node(
+            statement=statement,
+            node_type=NodeType.SOURCE,
+            cluster="source",
+            status=NodeStatus.SETTLED,
+            epistemic_status=ArtifactStatus.GROUNDED.value,
+            importance=0.2,
+            source_refs=[reference] if reference else [],
+            created_by=created_by,
+            source_type=source_type,
+            source_excerpt=(excerpt or "")[:600],
+        )
+        return self.add_node(node)
+
+    def _expand_source_refs(self, node_data: dict) -> list[str]:
+        refs = list(node_data.get("source_refs", []) or [])
+        for source_id in node_data.get("source_ids", []) or []:
+            source_node = self.get_node(source_id)
+            if not source_node:
+                continue
+            refs.extend(source_node.get("source_refs", []) or [])
+            source_stmt = source_node.get("statement", "")
+            if source_stmt and source_stmt not in refs:
+                refs.append(source_stmt)
+        return list(dict.fromkeys(refs))
+
+    def _workspace_node(self, node_id: str, data: dict) -> WorkspaceNode:
+        return WorkspaceNode(
+            id=node_id,
+            node_type=str(data.get("node_type", "")),
+            statement=data.get("statement", ""),
+            epistemic_status=data.get(
+                "epistemic_status",
+                ArtifactStatus.OPEN.value,
+            ),
+            importance=float(data.get("importance", 0.0) or 0.0),
+            mission_relevance=float(data.get("mission_relevance", 0.0) or 0.0),
+            source_ids=list(data.get("source_ids", []) or []),
+            source_refs=self._expand_source_refs(data),
+            provenance_spans=[
+                dict(span) for span in (data.get("provenance_spans", []) or [])
+                if isinstance(span, dict)
+            ],
+            extraction_confidence=float(
+                data.get("extraction_confidence", 0.0) or 0.0
+            ),
+            created_by=data.get("created_by", ""),
+        )
+
+    def build_workspace(self, embedding_index=None, query: str = "",
+                        max_evidence: int = 6, max_questions: int = 4,
+                        max_hypotheses: int = 4, max_priors: int = 4,
+                        max_tasks: int = 4) -> ScientistWorkspace:
+        mission = self.get_mission() or {}
+        scored_ids: dict[str, float] = {}
+
+        for rank, (nid, data) in enumerate(self.get_working_memory()):
+            scored_ids[nid] = max(
+                scored_ids.get(nid, 0.0),
+                1.2 + data.get("importance", 0.0) - (0.05 * rank),
+            )
+
+        if embedding_index and getattr(embedding_index, "size", 0) > 0 and query:
+            from embedding import embed as shared_embed
+
+            query_emb = shared_embed(query)
+            matches = embedding_index.query(query_emb, threshold=0.20, top_k=14)
+            for rank, (nid, score) in enumerate(matches):
+                scored_ids[nid] = max(
+                    scored_ids.get(nid, 0.0),
+                    float(score) + max(0.0, 0.25 - (rank * 0.01)),
+                )
+
+        mission_id = mission.get("id")
+        if mission_id:
+            for from_id, to_id, edge in self.graph.edges(data=True):
+                if to_id == mission_id:
+                    scored_ids[from_id] = max(
+                        scored_ids.get(from_id, 0.0),
+                        float(edge.get("weight", 0.0)) + 0.35,
+                    )
+
+        for nid, data in self.all_nodes():
+            if data.get("node_type") == NodeType.SOURCE.value:
+                continue
+            importance = float(data.get("importance", 0.0) or 0.0)
+            mission_relevance = float(data.get("mission_relevance", 0.0) or 0.0)
+            baseline = importance + (0.4 * mission_relevance)
+            if baseline >= 0.65:
+                scored_ids[nid] = max(scored_ids.get(nid, 0.0), baseline)
+
+        ordered = sorted(scored_ids.items(), key=lambda item: item[1], reverse=True)
+
+        grounded_evidence: list[WorkspaceNode] = []
+        working_hypotheses: list[WorkspaceNode] = []
+        prior_claims: list[WorkspaceNode] = []
+        active_questions: list[WorkspaceNode] = []
+        next_tasks: list[WorkspaceNode] = []
+
+        for nid, _ in ordered:
+            data = self.get_node(nid)
+            if not data:
+                continue
+            node_type = data.get("node_type", "")
+            epistemic = data.get("epistemic_status", ArtifactStatus.OPEN.value)
+            node = self._workspace_node(nid, data)
+
+            if (node_type in {
+                NodeType.EVIDENCE_CLAIM.value,
+                NodeType.ANSWER.value,
+                NodeType.EMPIRICAL.value,
+            } and epistemic == ArtifactStatus.GROUNDED.value):
+                if len(grounded_evidence) < max_evidence:
+                    grounded_evidence.append(node)
+                continue
+
+            if node_type == NodeType.HYPOTHESIS.value:
+                if epistemic == ArtifactStatus.PRIOR.value:
+                    if len(prior_claims) < max_priors:
+                        prior_claims.append(node)
+                elif epistemic in {
+                    ArtifactStatus.SPECULATIVE.value,
+                    ArtifactStatus.CONTRADICTED.value,
+                    ArtifactStatus.LACKS_EVIDENCE.value,
+                }:
+                    continue
+                elif len(working_hypotheses) < max_hypotheses:
+                    working_hypotheses.append(node)
+                continue
+
+            if node_type in {NodeType.QUESTION.value, NodeType.GAP.value}:
+                if len(active_questions) < max_questions:
+                    active_questions.append(node)
+                continue
+
+            if node_type == NodeType.TASK.value:
+                if len(next_tasks) < max_tasks:
+                    next_tasks.append(node)
+
+        contradictions = []
+        for u, v, edge in self.graph.edges(data=True):
+            if edge.get("type") != EdgeType.CONTRADICTS.value:
+                continue
+            node_u = self.get_node(u)
+            node_v = self.get_node(v)
+            if not node_u or not node_v:
+                continue
+            contradictions.append(
+                f"{node_u.get('statement', '')} VS {node_v.get('statement', '')}"
+            )
+            if len(contradictions) >= 4:
+                break
+
+        return ScientistWorkspace(
+            mission=mission.get("question", ""),
+            mission_context=mission.get("context", ""),
+            active_questions=active_questions,
+            grounded_evidence=grounded_evidence,
+            working_hypotheses=working_hypotheses,
+            prior_claims=prior_claims,
+            next_tasks=next_tasks,
+            contradictions=contradictions,
+        )
 
     # ── Working memory ────────────────────────────────────────────────────────
 
@@ -293,17 +513,137 @@ class Brain:
     def neighbors(self, node_id: str) -> list:
         return list(self.graph.successors(node_id))
 
+    # ── Pruning and synchronization ─────────────────────────────────────────
+
+    def snapshot_nodes(self) -> list[tuple[str, dict]]:
+        """Return a detached snapshot of current nodes for safe read operations."""
+        return [(nid, dict(data)) for nid, data in self.graph.nodes(data=True)]
+
+    def prune_nodes(self, node_ids: list[str] | set[str],
+                    preserve_ids: set[str] | None = None) -> dict:
+        """Remove nodes from the graph while maintaining core internal references."""
+        preserve = set(preserve_ids or set())
+        removable = []
+        removed_nodes = {}
+
+        for nid in list(dict.fromkeys(node_ids or [])):
+            if not nid or nid in preserve:
+                continue
+            if nid not in self.graph.nodes:
+                continue
+            removable.append(nid)
+            removed_nodes[nid] = dict(self.graph.nodes[nid])
+
+        if not removable:
+            return {
+                "removed_node_ids": [],
+                "removed_nodes": {},
+                "removed_count": 0,
+            }
+
+        for nid in removable:
+            self.graph.remove_node(nid)
+
+        if self.mission and self.mission.get("id") in removed_nodes:
+            self.mission = None
+        if self._suspended_mission and self._suspended_mission.get("id") in removed_nodes:
+            self._suspended_mission = None
+
+        self.working_memory = [nid for nid in self.working_memory if nid not in removed_nodes]
+
+        return {
+            "removed_node_ids": removable,
+            "removed_nodes": removed_nodes,
+            "removed_count": len(removable),
+        }
+
+    def synchronized_prune(self, node_ids: list[str] | set[str],
+                           embedding_index=None,
+                           observer=None,
+                           notebook=None,
+                           insight_buffer=None,
+                           preserve_ids: set[str] | None = None) -> dict:
+        """Prune nodes and synchronize dependent structures to avoid dangling refs."""
+        result = self.prune_nodes(node_ids=node_ids, preserve_ids=preserve_ids)
+        removed_ids = set(result.get("removed_node_ids", []))
+
+        if not removed_ids:
+            result["sync"] = {
+                "embedding_index_removed": 0,
+                "observer": {"cleaned": 0},
+                "notebook": {"cleaned": 0},
+                "insight_buffer": {"cleaned": 0},
+            }
+            return result
+
+        sync_report = {
+            "embedding_index_removed": 0,
+            "observer": {"cleaned": 0},
+            "notebook": {"cleaned": 0},
+            "insight_buffer": {"cleaned": 0},
+        }
+
+        if embedding_index is not None:
+            removed_count = 0
+            if hasattr(embedding_index, "prune_node_ids"):
+                try:
+                    removed_count = int(embedding_index.prune_node_ids(removed_ids) or 0)
+                except Exception:
+                    removed_count = 0
+            else:
+                for nid in removed_ids:
+                    if hasattr(embedding_index, "remove"):
+                        embedding_index.remove(nid)
+                        removed_count += 1
+                if hasattr(embedding_index, "flush"):
+                    embedding_index.flush()
+            sync_report["embedding_index_removed"] = removed_count
+
+        removed_nodes = result.get("removed_nodes", {})
+        if observer is not None and hasattr(observer, "remove_node_references"):
+            try:
+                observer_report = observer.remove_node_references(removed_ids)
+                if isinstance(observer_report, dict):
+                    sync_report["observer"] = observer_report
+            except Exception:
+                pass
+
+        if notebook is not None and hasattr(notebook, "remove_node_references"):
+            try:
+                notebook_report = notebook.remove_node_references(removed_ids, removed_nodes=removed_nodes)
+                if isinstance(notebook_report, dict):
+                    sync_report["notebook"] = notebook_report
+            except Exception:
+                pass
+
+        if insight_buffer is not None and hasattr(insight_buffer, "remove_node_references"):
+            try:
+                buffer_report = insight_buffer.remove_node_references(removed_ids)
+                if isinstance(buffer_report, dict):
+                    sync_report["insight_buffer"] = buffer_report
+            except Exception:
+                pass
+
+        result["sync"] = sync_report
+        return result
+
     # ── Analogy helper ────────────────────────────────────────────────────────
 
     def add_analogy_edge(self, from_id: str, to_id: str,
                          depth: str, narration: str,
-                         source: EdgeSource = EdgeSource.CONVERSATION) -> Edge:
+                         source: EdgeSource = EdgeSource.CONVERSATION,
+                         matcher_report: dict | None = None) -> Edge | None:
         type_map = {
             "surface":     EdgeType.SURFACE_ANALOGY,
             "structural":  EdgeType.STRUCTURAL_ANALOGY,
             "isomorphism": EdgeType.DEEP_ISOMORPHISM,
         }
         etype  = type_map.get(depth, EdgeType.STRUCTURAL_ANALOGY)
+        if etype == EdgeType.DEEP_ISOMORPHISM:
+            report = matcher_report or {}
+            passed = bool(report.get("passed", report.get("isomorphic", False)))
+            if not passed:
+                return None
         weight = ANALOGY_WEIGHTS.get(etype, 0.4)
         edge   = Edge(
             type          = etype,
@@ -311,7 +651,8 @@ class Brain:
             weight        = weight,
             confidence    = weight,
             source        = source,
-            analogy_depth = depth
+            analogy_depth = depth,
+            matcher_report = dict(matcher_report or {}),
         )
         self.add_edge(from_id, to_id, edge)
         return edge
@@ -563,10 +904,13 @@ class Brain:
             ),
             "node_types":         node_types,
             "analogy_breakdown":  analogy_breakdown,
+            "sources":            len(self.nodes_by_type(NodeType.SOURCE)),
+            "evidence_claims":    len(self.nodes_by_type(NodeType.EVIDENCE_CLAIM)),
             "hypotheses":         len(self.nodes_by_type(NodeType.HYPOTHESIS)),
             "open_questions":     len(self.nodes_by_type(NodeType.QUESTION)),
             "answers":            len(self.nodes_by_type(NodeType.ANSWER)),
             "empirical":          len(self.nodes_by_type(NodeType.EMPIRICAL)),
+            "tasks":              len(self.nodes_by_type(NodeType.TASK)),
             "mode":               self._mode.value,
             "mission":            self.mission['question']
                                   if self.mission else None,

@@ -1,18 +1,34 @@
 import json
+import re
 import time
+import urllib.parse
 import numpy as np
 from graph.brain import (Brain, Node, Edge, EdgeType, EdgeSource,
                          NodeStatus, NodeType, ANALOGY_WEIGHTS)
 from config import THRESHOLDS
 from embedding import embed as shared_embed
 from llm_utils import llm_call, require_json
+from scientist_workspace import ArtifactStatus
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SIMILARITY_THRESHOLD  = THRESHOLDS.MERGE_NODE
 DEDUP_QUERY_THRESHOLD = max(0.50, SIMILARITY_THRESHOLD - 0.16)
-DEDUP_LLM_THRESHOLD   = max(0.54, SIMILARITY_THRESHOLD - 0.14)
+DEDUP_LLM_THRESHOLD   = max(0.62, SIMILARITY_THRESHOLD - 0.08)
 WEAK_EDGE_THRESHOLD   = THRESHOLDS.WEAK_EDGE
+MISSION_RELEVANCE_PREFILTER = max(0.24, THRESHOLDS.AGENDA_PREFILTER)
+MISSION_RELEVANCE_FASTTRACK = 0.78
+EDGE_LLM_MIN_SIM = max(0.22, THRESHOLDS.AGENDA_PREFILTER)
+EDGE_LLM_MAX_PER_NODE = 3
+EDGE_LLM_BASE_BUDGET = 8
+EDGE_LLM_CALLS_PER_NODE_CAP = 2
+MAX_DEDUP_LLM_CANDIDATES = 2
+MAX_CONTRADICTION_LLM_CANDIDATES = 4
+MAX_ANSWER_MATCH_LLM_CHECKS = 3
+MAX_PROVENANCE_SPANS_PER_NODE = 3
+MAX_PROVENANCE_CANDIDATES = 36
+PROVENANCE_MIN_SPAN_CHARS = 80
+PROVENANCE_MAX_SPAN_CHARS = 1000
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -26,6 +42,8 @@ Rules:
 - Write each as 1-3 sentences. Not a keyword. Not a title. A thought.
 - Capture the perspective, not just the topic
 - If an idea contains a tension or uncertainty, include that in the statement
+- If the source contains competing or contradictory claims, extract EACH claim
+    as a separate node. Do not blend opposing claims into one reconciled summary.
 - CRITICAL: Use dense, precise technical terminology. Avoid all conversational filler or introductory fluff (e.g. do NOT write "This idea suggests that...").
 - Do NOT omit foundational named mechanisms, canonical examples, failure modes,
   or formal objects if they are central to understanding the text.
@@ -139,6 +157,11 @@ TYPE SELECTION RULES (CRITICAL) — read carefully before choosing:
 - "contradicts": Use ONLY when A and B make MUTUALLY EXCLUSIVE claims.
   ✓ "All objects fall at the same rate" contradicts "heavier objects fall faster"
   ✗ "Neural nets need data" vs "neural nets can overfit" — these are compatible
+    ✗ "Game theory assumes rational agents" vs
+        "Behavioral economics shows systematic deviations" — this is a critique /
+        boundary condition, not a mutual exclusion
+    ✗ "Energy is conserved" vs "Free energy decreases in spontaneous processes" —
+        these can both be true and are not contradictory
 
 - "analogy": Use when the same relational pattern appears in two different domains. You MUST specify depth:
   * "surface" (shared vocabulary/theme)
@@ -279,6 +302,21 @@ Examples:
 Respond with ONLY "yes" or "no".
 """
 
+CANONICAL_MERGE_PROMPT = """
+You are merging two duplicate scientific claims into ONE canonical claim.
+
+Claim A: {claim_a}
+Claim B: {claim_b}
+
+Rules:
+- Preserve only shared meaning that is defensible from both claims.
+- Do not concatenate both claims.
+- Do not add new unsupported assertions.
+- Use 1-2 precise sentences.
+
+Respond ONLY with the merged canonical claim.
+"""
+
 
 def _coerce_statement_list(items) -> list[str]:
     """Normalize LLM extraction output into a deduplicated list of statements."""
@@ -377,12 +415,22 @@ Respond ONLY with JSON.
 
 class Ingestor:
     def __init__(self, brain: Brain, research_agenda=None, embedding_index=None,
-                 insight_buffer=None):
+                 insight_buffer=None, critic=None):
         self.brain            = brain
         self._embedding_cache = {}
         self.research_agenda  = research_agenda
         self.index            = embedding_index
         self.insight_buffer   = insight_buffer
+        self.critic           = critic
+        self._contradiction_cache = {}
+        self._dedup_confirmation_cache = {}
+        self._canonical_merge_cache = {}
+        self._answer_match_cache = {}
+        self._mission_relevance_cache = {}
+        self._cluster_cache = {}
+        self._edge_decision_cache = {}
+        self._mission_embedding = None
+        self._mission_embedding_text = ""
         # ── Pre-dedup state ──
         # Track raw text chunks already ingested to avoid re-extracting through
         # the LLM when the same (or very similar) source text is submitted again.
@@ -460,21 +508,462 @@ class Ingestor:
                 result[node_id] = emb
         return result
 
+    def _candidate_importance(self, node_type: NodeType,
+                              source_quality: float,
+                              contradiction_count: int) -> float:
+        """Estimate initial claim importance before System 2 review."""
+        base = 0.40 + (0.35 * source_quality)
+        if node_type == NodeType.HYPOTHESIS:
+            base += 0.10
+        if contradiction_count > 0:
+            base += 0.05
+        return max(0.20, min(0.95, base))
+
+    def _merge_unique_list(self, left: list[str] | None,
+                           right: list[str] | None) -> list[str]:
+        merged = []
+        for item in (left or []) + (right or []):
+            if not item or item in merged:
+                continue
+            merged.append(item)
+        return merged
+
+    def _merge_provenance_spans(self, left: list[dict] | None,
+                                right: list[dict] | None,
+                                max_items: int = MAX_PROVENANCE_SPANS_PER_NODE) -> list[dict]:
+        merged = []
+        seen = set()
+        for span in (left or []) + (right or []):
+            if not isinstance(span, dict):
+                continue
+
+            try:
+                span_start = int(span.get("span_start", -1) or -1)
+            except (TypeError, ValueError):
+                span_start = -1
+            try:
+                span_end = int(span.get("span_end", -1) or -1)
+            except (TypeError, ValueError):
+                span_end = -1
+
+            key = (
+                str(span.get("source_id", "") or ""),
+                str(span.get("source_ref", "") or ""),
+                str(span.get("section_label", "") or ""),
+                span_start,
+                span_end,
+                " ".join(str(span.get("quote", "") or "").split()).lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized = dict(span)
+            try:
+                normalized["extraction_confidence"] = float(
+                    normalized.get("extraction_confidence", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                normalized["extraction_confidence"] = 0.0
+            merged.append(normalized)
+            if len(merged) >= max_items:
+                break
+        return merged
+
+    def _section_label_from_ref(self, source_ref: str) -> str:
+        ref = str(source_ref or "")
+        if "#section=" not in ref:
+            return ""
+        raw = ref.split("#section=", 1)[1]
+        return urllib.parse.unquote(raw).strip()
+
+    def _candidate_spans(self, text: str) -> list[dict]:
+        if not text:
+            return []
+
+        spans = []
+        cursor = 0
+        for chunk in re.split(r"\n\s*\n", text):
+            if not chunk.strip():
+                continue
+            start = text.find(chunk, cursor)
+            if start < 0:
+                start = cursor
+            end = start + len(chunk)
+            cursor = end
+
+            cleaned = " ".join(chunk.split())
+            if len(cleaned) < PROVENANCE_MIN_SPAN_CHARS:
+                continue
+
+            if len(cleaned) > PROVENANCE_MAX_SPAN_CHARS:
+                cleaned = cleaned[:PROVENANCE_MAX_SPAN_CHARS]
+
+            spans.append({
+                "quote": cleaned,
+                "span_start": start,
+                "span_end": end,
+            })
+            if len(spans) >= MAX_PROVENANCE_CANDIDATES:
+                break
+
+        if spans:
+            return spans
+
+        cleaned = " ".join(text.split())
+        if len(cleaned) >= PROVENANCE_MIN_SPAN_CHARS:
+            return [{
+                "quote": cleaned[:PROVENANCE_MAX_SPAN_CHARS],
+                "span_start": 0,
+                "span_end": min(len(text), PROVENANCE_MAX_SPAN_CHARS),
+            }]
+        return []
+
+    def _statement_provenance_spans(self, statement: str,
+                                    text: str,
+                                    source_ids: list[str] | None,
+                                    source_refs: list[str] | None,
+                                    source: EdgeSource) -> list[dict]:
+        if source not in {EdgeSource.READING, EdgeSource.RESEARCH}:
+            return []
+
+        refs = [
+            str(ref).strip()
+            for ref in (source_refs or [])
+            if str(ref).strip()
+        ]
+        ids = [
+            str(sid).strip()
+            for sid in (source_ids or [])
+            if str(sid).strip()
+        ]
+        if not refs and ids:
+            for sid in ids:
+                source_node = self.brain.get_node(sid)
+                if not source_node:
+                    continue
+                source_node_refs = [
+                    str(ref).strip()
+                    for ref in (source_node.get("source_refs", []) or [])
+                    if str(ref).strip()
+                ]
+                if source_node_refs:
+                    refs.extend(source_node_refs)
+                elif source_node.get("statement"):
+                    refs.append(str(source_node.get("statement", "")).strip())
+        if not refs and not ids:
+            return []
+
+        candidates = self._candidate_spans(text)
+        if not candidates:
+            return []
+
+        stmt_emb = self._embed(statement)
+        best_span = None
+        best_sim = -1.0
+        for candidate in candidates:
+            sim = self._cosine(stmt_emb, self._embed(candidate["quote"]))
+            if sim > best_sim:
+                best_sim = sim
+                best_span = candidate
+
+        if best_span is None:
+            return []
+
+        confidence = max(0.0, min(1.0, float(best_sim)))
+        pairs = max(1, len(refs), len(ids))
+        spans = []
+        for idx in range(pairs):
+            source_ref = refs[idx] if idx < len(refs) else (refs[0] if refs else "")
+            source_id = ids[idx] if idx < len(ids) else (ids[0] if ids else "")
+            spans.append({
+                "source_id": source_id,
+                "source_ref": source_ref,
+                "section_label": self._section_label_from_ref(source_ref),
+                "span_start": int(best_span.get("span_start", -1)),
+                "span_end": int(best_span.get("span_end", -1)),
+                "quote": str(best_span.get("quote", "") or "")[:320],
+                "extraction_confidence": confidence,
+            })
+            if len(spans) >= MAX_PROVENANCE_SPANS_PER_NODE:
+                break
+        return spans
+
+    def _default_claim_node_type(self, source: EdgeSource) -> NodeType:
+        if source in {EdgeSource.READING, EdgeSource.RESEARCH}:
+            return NodeType.EVIDENCE_CLAIM
+        return NodeType.CONCEPT
+
+    def _epistemic_status_for(self, source: EdgeSource,
+                              node_type: NodeType,
+                              is_contradicted: bool = False) -> str:
+        if is_contradicted:
+            return ArtifactStatus.CONTRADICTED.value
+        if node_type in {NodeType.QUESTION, NodeType.TASK}:
+            return ArtifactStatus.OPEN.value
+        if node_type == NodeType.GAP:
+            return ArtifactStatus.SPECULATIVE.value
+        if node_type == NodeType.HYPOTHESIS:
+            if source == EdgeSource.CONVERSATION:
+                return ArtifactStatus.PRIOR.value
+            return ArtifactStatus.SPECULATIVE.value
+        if node_type in {
+            NodeType.EVIDENCE_CLAIM,
+            NodeType.ANSWER,
+            NodeType.EMPIRICAL,
+        } and source in {EdgeSource.READING, EdgeSource.RESEARCH}:
+            return ArtifactStatus.GROUNDED.value
+        if source == EdgeSource.CONVERSATION:
+            return ArtifactStatus.PRIOR.value
+        if source in {EdgeSource.DREAM, EdgeSource.CONSOLIDATION}:
+            return ArtifactStatus.SPECULATIVE.value
+        return ArtifactStatus.OPEN.value
+
+    def _normalize_text_key(self, text: str) -> str:
+        return ' '.join((text or '').split()).lower()
+
+    def _dedup_confirmed(self, claim_a: str, claim_b: str,
+                         similarity: float) -> bool:
+        key = self._normalize_pair_key(claim_a, claim_b)
+        if key in self._dedup_confirmation_cache:
+            return self._dedup_confirmation_cache[key]
+
+        confirm = self._llm(
+            DEDUP_CONFIRMATION_PROMPT.format(
+                node_a=claim_a,
+                node_b=claim_b,
+                similarity=similarity,
+            ),
+            temperature=0.0
+        ).strip().lower()
+        is_dup = confirm.startswith("yes")
+        self._dedup_confirmation_cache[key] = is_dup
+        return is_dup
+
+    def _canonical_merge_statement(self, claim_a: str, claim_b: str) -> str:
+        key = self._normalize_pair_key(claim_a, claim_b)
+        if key in self._canonical_merge_cache:
+            return self._canonical_merge_cache[key]
+
+        merged = self._llm(
+            CANONICAL_MERGE_PROMPT.format(claim_a=claim_a, claim_b=claim_b),
+            temperature=0.0
+        ).strip()
+        if not merged or len(merged) < 16:
+            merged = claim_a
+        self._canonical_merge_cache[key] = merged
+        return merged
+
+    def _cluster_for_statement(self, statement: str) -> str:
+        key = self._normalize_text_key(statement)
+        if key in self._cluster_cache:
+            return self._cluster_cache[key]
+
+        cluster = self._llm(
+            CLUSTER_PROMPT.format(statement=statement)
+        ).strip().lower()
+        if not cluster:
+            cluster = "general"
+        self._cluster_cache[key] = cluster
+        return cluster
+
+    def _mission_similarity(self, statement: str) -> float:
+        mission = self.brain.get_mission()
+        if not mission:
+            return 0.0
+        mission_text = (mission.get('question') or '').strip()
+        if not mission_text:
+            return 0.0
+
+        if mission_text != self._mission_embedding_text:
+            self._mission_embedding = self._embed(mission_text)
+            self._mission_embedding_text = mission_text
+
+        stmt_emb = self._embed(statement)
+        return self._cosine(stmt_emb, self._mission_embedding)
+
+    def _node_embedding(self, node_id: str, statement: str = "") -> np.ndarray | None:
+        if self.index:
+            emb = self.index.get_embedding(node_id)
+            if emb is not None:
+                return emb
+        if node_id in self._embedding_cache:
+            return self._embedding_cache[node_id]
+        if statement:
+            return self._embed(statement)
+        return None
+
+    def _normalize_pair_key(self, a: str, b: str) -> tuple[str, str]:
+        left = ' '.join((a or '').split()).lower()
+        right = ' '.join((b or '').split()).lower()
+        return tuple(sorted((left, right)))
+
+    def _claims_contradict(self, existing_statement: str,
+                           new_statement: str) -> bool:
+        key = self._normalize_pair_key(existing_statement, new_statement)
+        if key in self._contradiction_cache:
+            return self._contradiction_cache[key]
+
+        check = self._llm(
+            CONTRADICTION_CHECK_PROMPT.format(
+                existing=existing_statement,
+                new=new_statement
+            ),
+            temperature=0.0
+        )
+        contradicts = check.lower().strip().startswith('yes')
+        self._contradiction_cache[key] = contradicts
+        return contradicts
+
+    def _build_review_context(self, stmt_emb: np.ndarray, cluster: str,
+                              source: EdgeSource,
+                              contradiction_ids: list[str]) -> str:
+        lines = [
+            f"Source: {source.value}",
+            f"Proposed cluster: {cluster}",
+        ]
+        if contradiction_ids:
+            lines.append("Potential contradictions:")
+            for nid in contradiction_ids[:4]:
+                node = self.brain.get_node(nid)
+                if node:
+                    lines.append(f"- {node.get('statement', '')}")
+
+        if self.index:
+            matches = self.index.query(stmt_emb, threshold=0.58, top_k=4)
+            if matches:
+                lines.append("Nearest existing claims:")
+                for nid, sim in matches:
+                    node = self.brain.get_node(nid)
+                    if node:
+                        lines.append(
+                            f"- [sim={sim:.2f}] {node.get('statement', '')}"
+                        )
+        return "\n".join(lines)
+
+    def _review_statement(self, statement: str, node_type: NodeType,
+                          source: EdgeSource, importance: float,
+                          context: str, contradiction_ids: list[str],
+                          source_ids: list[str] | None = None,
+                          source_refs: list[str] | None = None,
+                          expected_status: str = ArtifactStatus.OPEN.value,
+                          ) -> tuple[str, float, bool]:
+        """Send a candidate claim through System 2 review when available."""
+        if not self.critic:
+            return statement, importance, True
+
+        # Skip full Critic review for grounded reading/research evidence claims.
+        # These are already grounded by provenance — running the adversarial
+        # dialogue is wasted compute (~3-6 LLM calls per claim saved).
+        if source in (EdgeSource.READING, EdgeSource.RESEARCH) and \
+           node_type in (NodeType.EVIDENCE_CLAIM, NodeType.ANSWER,
+                         NodeType.EMPIRICAL, NodeType.CONCEPT):
+            return statement, importance, True
+
+        from critic.critic import CandidateThought, Verdict
+
+        candidate = CandidateThought(
+            claim=statement,
+            source_module="ingestor",
+            proposed_type=node_type.value,
+            importance=importance,
+            context=context,
+            contradicts_existing=bool(contradiction_ids),
+            grounded_evidence=list(source_refs or []),
+            source_ids=list(source_ids or []),
+            expected_status=expected_status,
+        )
+        critic_log = self.critic.evaluate_with_refinement(candidate)
+        final_claim = (critic_log.final_claim or statement).strip()
+
+        if critic_log.verdict == Verdict.ACCEPT:
+            if final_claim != statement:
+                print("  ↺ Critic refined ingested claim")
+            adjusted_importance = max(importance * 0.7, critic_log.confidence)
+            return final_claim, adjusted_importance, True
+
+        if critic_log.verdict == Verdict.DEFER:
+            deferred_candidate = CandidateThought(
+                claim=final_claim,
+                source_module=candidate.source_module,
+                proposed_type=candidate.proposed_type,
+                importance=candidate.importance,
+                context=candidate.context,
+                edge_type=candidate.edge_type,
+                node_a_id=candidate.node_a_id,
+                node_b_id=candidate.node_b_id,
+                crosses_domains=candidate.crosses_domains,
+                contradicts_existing=candidate.contradicts_existing,
+                grounded_evidence=list(candidate.grounded_evidence),
+                source_ids=list(candidate.source_ids),
+                expected_status=candidate.expected_status,
+            )
+            self.critic.route_deferred(deferred_candidate)
+            print("  ◇ Critic deferred ingested claim")
+            return "", 0.0, False
+
+        print("  ✗ Critic rejected ingested claim")
+        return "", 0.0, False
+
+    def _escalate_contradiction(self, new_node_id: str,
+                                existing_node_id: str):
+        if not self.research_agenda or not hasattr(self.research_agenda, "add_to_agenda"):
+            return
+        new_node = self.brain.get_node(new_node_id)
+        existing = self.brain.get_node(existing_node_id)
+        if not new_node or not existing:
+            return
+
+        question = (
+            "Resolve contradiction: "
+            f"{new_node.get('statement', '')[:120]} "
+            "VS "
+            f"{existing.get('statement', '')[:120]}"
+        )
+        item = self.research_agenda.add_to_agenda(
+            text=question,
+            item_type="question",
+            cycle=getattr(self.research_agenda, 'cycle_count', 0),
+            node_id=new_node_id,
+        )
+        item.priority = max(item.priority, 0.9)
+
     # ── Answer detection ──────────────────────────────────────────────────────
 
     def _check_against_agenda(self, node_id: str, statement: str):
         if not self.research_agenda:
             return
         open_items = self.research_agenda.get_prioritized_questions(20)
+        if not open_items:
+            return
+
         node_emb = self._embed(statement)
+        scored_items = []
         for item in open_items:
             item_emb = self._embed(item.text)
-            if self._cosine(node_emb, item_emb) < THRESHOLDS.AGENDA_PREFILTER:
+            sim = self._cosine(node_emb, item_emb)
+            if sim >= THRESHOLDS.AGENDA_PREFILTER:
+                scored_items.append((sim, item))
+
+        if not scored_items:
+            return
+
+        scored_items.sort(reverse=True, key=lambda t: t[0])
+        for _, item in scored_items[:MAX_ANSWER_MATCH_LLM_CHECKS]:
+            cache_key = (
+                self._normalize_text_key(item.text),
+                self._normalize_text_key(statement),
+            )
+            result = self._answer_match_cache.get(cache_key)
+            if result is None:
+                raw = self._llm(ANSWER_MATCH_PROMPT.format(
+                    question=item.text, candidate=statement
+                ), temperature=0.1)
+                result = require_json(raw, default={})
+                self._answer_match_cache[cache_key] = result
+
+            if not isinstance(result, dict):
                 continue
-            raw = self._llm(ANSWER_MATCH_PROMPT.format(
-                question=item.text, candidate=statement
-            ), temperature=0.1)
-            result = require_json(raw, default={})
+
             match       = result.get('match', 'none')
             explanation = result.get('explanation', '')
             if match == 'strong':
@@ -504,13 +993,61 @@ class Ingestor:
         mission = self.brain.get_mission()
         if not mission:
             return
-        raw = self._llm(MISSION_RELEVANCE_PROMPT.format(
-            mission   = mission['question'],
-            statement = statement
-        ), temperature=0.0)
-        result = require_json(raw, default={})
+
+        cache_key = (
+            self._normalize_text_key(mission['question']),
+            self._normalize_text_key(statement),
+        )
+        mission_sim = self._mission_similarity(statement)
+        self.brain.update_node(
+            node_id,
+            mission_relevance=max(
+                mission_sim,
+                float(self.brain.get_node(node_id).get("mission_relevance", 0.0) or 0.0),
+            ),
+        )
+        if mission_sim < MISSION_RELEVANCE_PREFILTER:
+            return
+        if mission_sim >= MISSION_RELEVANCE_FASTTRACK:
+            result = {
+                "relevant": True,
+                "strength": round(mission_sim, 3),
+                "narration": "Direct semantic match to the active mission.",
+            }
+            self._mission_relevance_cache[cache_key] = result
+            self.brain.link_to_mission(
+                node_id,
+                result["narration"],
+                strength=mission_sim,
+            )
+            print(f"  ↗ Mission link (strength={mission_sim:.2f})")
+            return
+
+        result = self._mission_relevance_cache.get(cache_key)
+        if result is None:
+            raw = self._llm(MISSION_RELEVANCE_PROMPT.format(
+                mission   = mission['question'],
+                statement = statement
+            ), temperature=0.0)
+            result = require_json(raw, default={})
+            self._mission_relevance_cache[cache_key] = result
+
+        if not isinstance(result, dict):
+            return
+
         strength = result.get('strength', 0)
+        try:
+            strength = float(strength)
+        except (TypeError, ValueError):
+            strength = 0.0
         if result.get('relevant') and strength >= THRESHOLDS.MISSION_LINK:
+            self.brain.update_node(
+                node_id,
+                mission_relevance=max(
+                    strength,
+                    float(self.brain.get_node(node_id).get("mission_relevance", 0.0) or 0.0),
+                ),
+            )
             self.brain.link_to_mission(
                 node_id,
                 result.get('narration', ''),
@@ -518,9 +1055,66 @@ class Ingestor:
             )
             print(f"  ↗ Mission link (strength={strength:.2f})")
 
+    def ingest_sections(self, sections: list[dict],
+                        source: EdgeSource = EdgeSource.CONVERSATION,
+                        prediction: str = "",
+                        source_ids: list[str] | None = None,
+                        source_refs: list[str] | None = None,
+                        created_by: str = "") -> list[str]:
+        """Ingest sectioned source text while preserving section anchor refs.
+
+        Each section dict may include:
+          - label: section heading
+          - text: section body
+          - source_ids: optional section-specific source node IDs
+          - source_refs: optional section-specific refs
+        """
+        all_new_ids = []
+        for idx, section in enumerate(sections, start=1):
+            label = str(section.get("label", f"section_{idx}")).strip() or f"section_{idx}"
+            section_text = str(section.get("text", "")).strip()
+            if not section_text:
+                continue
+
+            section_source_ids = list(section.get("source_ids") or source_ids or [])
+            section_source_refs = list(section.get("source_refs") or source_refs or [])
+            if not section.get("source_refs"):
+                safe_label = urllib.parse.quote(
+                    label.lower().replace(" ", "_")[:80],
+                    safe="",
+                )
+                anchored_refs = []
+                for ref in section_source_refs:
+                    base = str(ref or "").strip()
+                    if not base:
+                        continue
+                    if "#" in base:
+                        base = base.split("#", 1)[0]
+                    anchored_refs.append(f"{base}#section={safe_label}")
+                section_source_refs = anchored_refs
+
+            section_created_by = created_by
+            if section_created_by:
+                section_created_by = f"{section_created_by}:{label}"
+
+            new_ids = self.ingest(
+                section_text,
+                source=source,
+                prediction=prediction,
+                source_ids=section_source_ids,
+                source_refs=section_source_refs,
+                created_by=section_created_by,
+            ) or []
+            all_new_ids.extend(new_ids)
+
+        return list(dict.fromkeys(all_new_ids))
+
     # ── Core pipeline ─────────────────────────────────────────────────────────
 
-    def ingest(self, text: str, source: EdgeSource = EdgeSource.CONVERSATION, prediction: str = ""):
+    def ingest(self, text: str, source: EdgeSource = EdgeSource.CONVERSATION,
+               prediction: str = "", source_ids: list[str] | None = None,
+               source_refs: list[str] | None = None,
+               created_by: str = ""):
         print(f"\n── Ingesting {len(text)} chars [{source.value}] ──")
 
         # ── Pre-dedup: filter out text that was already ingested ──
@@ -568,13 +1162,55 @@ class Ingestor:
 
         print(f"  Extracted {len(hypotheses)} hypotheses")
 
+        provenance_by_statement: dict[str, list[dict]] = {}
+        if source in {EdgeSource.READING, EdgeSource.RESEARCH}:
+            for stmt in statements:
+                provenance_by_statement[self._normalize_text_key(stmt)] = (
+                    self._statement_provenance_spans(
+                        stmt,
+                        text,
+                        source_ids,
+                        source_refs,
+                        source,
+                    )
+                )
+
+            for hyp in hypotheses:
+                stmt = hyp if isinstance(hyp, str) else hyp.get('statement', '')
+                if not isinstance(stmt, str) or not stmt.strip():
+                    continue
+                key = self._normalize_text_key(stmt)
+                if key in provenance_by_statement:
+                    continue
+                provenance_by_statement[key] = self._statement_provenance_spans(
+                    stmt,
+                    text,
+                    source_ids,
+                    source_refs,
+                    source,
+                )
+
         new_node_ids      = []
         existing_embeddings = None if self.index else self._get_all_embeddings()
+        default_claim_type = self._default_claim_node_type(source)
 
         # process concepts
         for stmt in statements:
+            stmt_key = self._normalize_text_key(stmt)
+            stmt_spans = provenance_by_statement.get(stmt_key, [])
             nid = self._process_statement(
-                stmt, existing_embeddings, source, NodeType.CONCEPT
+                stmt, existing_embeddings, source, default_claim_type,
+                source_ids=source_ids,
+                source_refs=source_refs,
+                provenance_spans=stmt_spans,
+                extraction_confidence=max(
+                    [
+                        float(span.get("extraction_confidence", 0.0) or 0.0)
+                        for span in stmt_spans
+                    ]
+                    or [0.0]
+                ),
+                created_by=created_by,
             )
             if nid:
                 new_node_ids.append(nid)
@@ -592,10 +1228,23 @@ class Ingestor:
             stmt = hyp.get('statement', '')
             if not isinstance(stmt, str) or not stmt.strip():
                 continue
+            stmt_key = self._normalize_text_key(stmt)
+            stmt_spans = provenance_by_statement.get(stmt_key, [])
             nid = self._process_statement(
                 stmt, existing_embeddings, source, NodeType.HYPOTHESIS,
                 predicted_answer=hyp.get('predicted_answer', ''),
-                testable_by=hyp.get('testable_by', '')
+                testable_by=hyp.get('testable_by', ''),
+                source_ids=source_ids,
+                source_refs=source_refs,
+                provenance_spans=stmt_spans,
+                extraction_confidence=max(
+                    [
+                        float(span.get("extraction_confidence", 0.0) or 0.0)
+                        for span in stmt_spans
+                    ]
+                    or [0.0]
+                ),
+                created_by=created_by,
             )
             if nid:
                 new_node_ids.append(nid)
@@ -603,10 +1252,19 @@ class Ingestor:
                     existing_embeddings[nid] = self._embedding_cache.get(
                         nid, self._embed(stmt))
 
+        # Deduplicate active node ids for downstream expensive stages.
+        # `_process_statement` may return existing node ids on merges/upgrades,
+        # which can create duplicate pair evaluations if not normalized here.
+        active_node_ids = list(dict.fromkeys(new_node_ids))
+
         # predictive processing (expectation engine)
-        if prediction and new_node_ids:
+        if prediction and active_node_ids:
             pred_emb  = self._embed(prediction)
-            node_embs = [self._embedding_cache[nid] for nid in new_node_ids if nid in self._embedding_cache]
+            node_embs = [
+                self._embedding_cache[nid]
+                for nid in active_node_ids
+                if nid in self._embedding_cache
+            ]
             if node_embs:
                 mean_emb = np.mean(node_embs, axis=0)
                 mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-10)
@@ -617,68 +1275,160 @@ class Ingestor:
                 # modulate importance based on surprise
                 if surprise < 0.2:
                     print("  [Predictive Processing] Low surprise. Dampening importance.")
-                    for nid in new_node_ids:
+                    for nid in active_node_ids:
                         node = self.brain.get_node(nid)
                         if node:
                             self.brain.update_node(nid, importance=node.get('importance', 0.5) * 0.5)
                 elif surprise > 0.6:
                     print("  [Predictive Processing] High surprise! Boosting importance.")
-                    for nid in new_node_ids:
+                    for nid in active_node_ids:
                         node = self.brain.get_node(nid)
                         if node:
                             self.brain.update_node(nid, importance=min(1.0, node.get('importance', 0.5) + 0.3))
 
-        # extract edges
-        for i in range(len(new_node_ids)):
-            for j in range(i + 1, len(new_node_ids)):
-                id_a, id_b = new_node_ids[i], new_node_ids[j]
+        # extract high-value edges with semantic pre-ranking and bounded review
+        edge_candidates = []
+        for i in range(len(active_node_ids)):
+            for j in range(i + 1, len(active_node_ids)):
+                id_a, id_b = active_node_ids[i], active_node_ids[j]
                 if (id_a == id_b or
                         self.brain.graph.has_edge(id_a, id_b) or
                         self.brain.graph.has_edge(id_b, id_a)):
                     continue
+
                 node_a = self.brain.get_node(id_a)
                 node_b = self.brain.get_node(id_b)
                 if not node_a or not node_b:
                     continue
-                raw_edge = self._llm(EDGE_EXTRACTION_PROMPT.format(
-                    node_a=node_a['statement'],
-                    node_b=node_b['statement']
-                ))
-                try:
-                    ed = require_json(raw_edge, default={})
-                    if ed.get('related'):
-                        raw_type = ed.get('type', 'associated')
 
-                        if raw_type == 'analogy':
-                            depth = ed.get('analogy_depth', 'structural')
-                            self.brain.add_analogy_edge(
-                                id_a, id_b, depth,
-                                ed.get('narration', ''), source
+                emb_a = self._node_embedding(id_a, node_a.get('statement', ''))
+                emb_b = self._node_embedding(id_b, node_b.get('statement', ''))
+                if emb_a is None or emb_b is None:
+                    continue
+
+                sim = self._cosine(emb_a, emb_b)
+                cross_cluster = (
+                    node_a.get('cluster') and
+                    node_b.get('cluster') and
+                    node_a.get('cluster') != node_b.get('cluster')
+                )
+
+                if sim < EDGE_LLM_MIN_SIM and not (cross_cluster and sim >= 0.18):
+                    continue
+
+                priority = sim + (0.04 if cross_cluster else 0.0)
+                edge_candidates.append((
+                    priority,
+                    id_a,
+                    id_b,
+                    node_a['statement'],
+                    node_b['statement'],
+                ))
+
+        edge_budget = max(
+            EDGE_LLM_BASE_BUDGET,
+            EDGE_LLM_MAX_PER_NODE * max(1, len(active_node_ids)),
+        )
+        edge_candidates.sort(reverse=True)
+        selected_edges = []
+        per_node_counts = {}
+        for candidate in edge_candidates:
+            if len(selected_edges) >= edge_budget:
+                break
+            _, id_a, id_b, _, _ = candidate
+            if (per_node_counts.get(id_a, 0) >= EDGE_LLM_CALLS_PER_NODE_CAP or
+                    per_node_counts.get(id_b, 0) >= EDGE_LLM_CALLS_PER_NODE_CAP):
+                continue
+            selected_edges.append(candidate)
+            per_node_counts[id_a] = per_node_counts.get(id_a, 0) + 1
+            per_node_counts[id_b] = per_node_counts.get(id_b, 0) + 1
+
+        skipped = max(0, len(edge_candidates) - len(selected_edges))
+        if skipped:
+            print(
+                f"  Edge extraction budget: reviewed {len(selected_edges)} "
+                f"of {len(edge_candidates)} candidate pairs"
+            )
+
+        for _, id_a, id_b, stmt_a, stmt_b in selected_edges:
+            # Re-check existence because selected_edges is built before any
+            # new edges are added in this pass.
+            if (self.brain.graph.has_edge(id_a, id_b) or
+                    self.brain.graph.has_edge(id_b, id_a)):
+                continue
+
+            pair_key = self._normalize_pair_key(stmt_a, stmt_b)
+            ed = self._edge_decision_cache.get(pair_key)
+            if ed is None:
+                raw_edge = self._llm(EDGE_EXTRACTION_PROMPT.format(
+                    node_a=stmt_a,
+                    node_b=stmt_b
+                ))
+                ed = require_json(raw_edge, default={})
+                self._edge_decision_cache[pair_key] = ed
+
+            if not isinstance(ed, dict):
+                continue
+
+            try:
+                if ed.get('related'):
+                    edge_payload = dict(ed)
+                    raw_type = edge_payload.get('type', 'associated')
+
+                    # Revalidate contradiction edges with the dedicated
+                    # contradiction checker so critique/exception relations are
+                    # not mislabeled as mutually exclusive claims.
+                    if (raw_type == 'contradicts' and
+                            not self._claims_contradict(stmt_a, stmt_b)):
+                        raw_type = 'associated'
+                        edge_payload['type'] = 'associated'
+                        if not edge_payload.get('narration'):
+                            edge_payload['narration'] = (
+                                "Topical relation without mutual exclusion."
                             )
-                            print(f"  Edge [analogy:{depth}]: "
-                                  f"{id_a[:8]} ↔ {id_b[:8]}")
-                        else:
-                            try:
-                                etype  = EdgeType(raw_type)
-                            except ValueError:
-                                etype  = EdgeType.ASSOCIATED
-                            exempt = (etype == EdgeType.CONTRADICTS)
-                            edge   = Edge(
-                                type         = etype,
-                                narration    = ed.get('narration', ''),
-                                weight       = ed.get('weight', 0.5),
-                                confidence   = ed.get('confidence', 0.5),
-                                source       = source,
-                                decay_exempt = exempt
-                            )
-                            self.brain.add_edge(id_a, id_b, edge)
-                            print(f"  Edge [{etype.value}]: "
-                                  f"{id_a[:8]} ↔ {id_b[:8]}")
-                except (json.JSONDecodeError, ValueError) as e:
-                    print(f"  Edge error: {e}")
+
+                    if raw_type == 'analogy':
+                        depth = edge_payload.get('analogy_depth', 'structural')
+                        self.brain.add_analogy_edge(
+                            id_a, id_b, depth,
+                            edge_payload.get('narration', ''), source
+                        )
+                        print(f"  Edge [analogy:{depth}]: "
+                              f"{id_a[:8]} ↔ {id_b[:8]}")
+                    else:
+                        try:
+                            etype = EdgeType(raw_type)
+                        except ValueError:
+                            etype = EdgeType.ASSOCIATED
+
+                        weight = edge_payload.get('weight', 0.5)
+                        confidence = edge_payload.get('confidence', 0.5)
+                        try:
+                            weight = float(weight)
+                        except (TypeError, ValueError):
+                            weight = 0.5
+                        try:
+                            confidence = float(confidence)
+                        except (TypeError, ValueError):
+                            confidence = 0.5
+
+                        exempt = (etype == EdgeType.CONTRADICTS)
+                        edge = Edge(
+                            type         = etype,
+                            narration    = edge_payload.get('narration', ''),
+                            weight       = max(0.0, min(1.0, weight)),
+                            confidence   = max(0.0, min(1.0, confidence)),
+                            source       = source,
+                            decay_exempt = exempt
+                        )
+                        self.brain.add_edge(id_a, id_b, edge)
+                        print(f"  Edge [{etype.value}]: "
+                              f"{id_a[:8]} ↔ {id_b[:8]}")
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                print(f"  Edge error: {e}")
 
         # weak associative edges
-        self._add_weak_edges(new_node_ids, source)
+        self._add_weak_edges(active_node_ids, source)
 
         print(f"\n── Ingestion complete. {self.brain.stats()['nodes']} nodes, "
               f"{self.brain.stats()['edges']} edges ──\n")
@@ -687,10 +1437,33 @@ class Ingestor:
     def _process_statement(self, stmt: str, existing_embeddings,
                            source: EdgeSource, node_type: NodeType,
                            predicted_answer: str = "",
-                           testable_by: str = "") -> str:
+                           testable_by: str = "",
+                           source_ids: list[str] | None = None,
+                           source_refs: list[str] | None = None,
+                           provenance_spans: list[dict] | None = None,
+                           extraction_confidence: float = 0.0,
+                           created_by: str = "") -> str:
         stmt_emb        = self._embed(stmt)
         best_match_id   = None
         best_similarity = 0.0
+
+        try:
+            extraction_confidence = float(extraction_confidence)
+        except (TypeError, ValueError):
+            extraction_confidence = 0.0
+        extraction_confidence = max(0.0, min(1.0, extraction_confidence))
+        provenance_spans = self._merge_provenance_spans([], provenance_spans)
+
+        # Source quality mapping
+        source_quality_map = {
+            EdgeSource.READING:       0.9,
+            EdgeSource.RESEARCH:      0.8,
+            EdgeSource.CONVERSATION:  0.7,
+            EdgeSource.CONSOLIDATION: 0.6,
+            EdgeSource.SANDBOX:       0.7,
+            EdgeSource.DREAM:         0.3,
+        }
+        sq = source_quality_map.get(source, 0.5)
 
         # ── Duplicate detection (indexed or fallback) ──
         if self.index:
@@ -699,25 +1472,22 @@ class Ingestor:
             matches = self.index.query(
                 stmt_emb, threshold=DEDUP_QUERY_THRESHOLD, top_k=5
             )
+            reviewed_candidates = 0
             for candidate_id, candidate_sim in matches:
-                if candidate_id == node_type:
-                    continue
                 if candidate_sim >= SIMILARITY_THRESHOLD:
                     best_match_id   = candidate_id
                     best_similarity = candidate_sim
                     break
                 elif candidate_sim >= DEDUP_LLM_THRESHOLD:
+                    if reviewed_candidates >= MAX_DEDUP_LLM_CANDIDATES:
+                        continue
                     candidate_data = self.brain.get_node(candidate_id)
                     if candidate_data:
-                        confirm = self._llm(
-                            DEDUP_CONFIRMATION_PROMPT.format(
-                                node_a=candidate_data["statement"],
-                                node_b=stmt,
-                                similarity=candidate_sim,
-                            ),
-                            temperature=0.0
-                        ).strip().lower()
-                        if confirm.startswith("yes"):
+                        reviewed_candidates += 1
+                        if self._dedup_confirmed(
+                                candidate_data["statement"],
+                                stmt,
+                                candidate_sim):
                             best_match_id   = candidate_id
                             best_similarity = candidate_sim
                             break
@@ -731,41 +1501,77 @@ class Ingestor:
                     DEDUP_LLM_THRESHOLD <= best_similarity < SIMILARITY_THRESHOLD):
                 candidate_data = self.brain.get_node(best_match_id)
                 if candidate_data:
-                    confirm = self._llm(
-                        DEDUP_CONFIRMATION_PROMPT.format(
-                            node_a=candidate_data["statement"],
-                            node_b=stmt,
-                            similarity=best_similarity,
-                        ),
-                        temperature=0.0
-                    ).strip().lower()
-                    if not confirm.startswith("yes"):
+                    if not self._dedup_confirmed(
+                            candidate_data["statement"],
+                            stmt,
+                            best_similarity):
                         best_match_id   = None
                         best_similarity = 0.0
 
         if best_similarity >= SIMILARITY_THRESHOLD:
             existing = self.brain.get_node(best_match_id)
-            enriched = existing['statement'] + " | " + stmt
-            self.brain.update_node(best_match_id, statement=enriched)
-            enriched_emb = self._embed(enriched)
-            self._embedding_cache[best_match_id] = enriched_emb
-            if self.index:
-                self.index.add(best_match_id, enriched_emb)
-            # upgrade type if more specific
-            if (node_type == NodeType.HYPOTHESIS and
-                    existing.get('node_type') == NodeType.CONCEPT.value):
-                self.brain.update_node(best_match_id,
-                    node_type        = NodeType.HYPOTHESIS.value,
-                    predicted_answer = predicted_answer,
-                    testable_by      = testable_by)
-                print(f"  Upgraded to HYPOTHESIS")
+            if not existing:
+                best_match_id = None
+                best_similarity = 0.0
+            elif self._claims_contradict(existing['statement'], stmt):
+                best_match_id = None
+                best_similarity = 0.0
+                print("  Similar but contradictory — creating separate node")
             else:
-                print(f"  Enriched existing (sim={best_similarity:.2f})")
-            return best_match_id
+                merged_stmt = self._canonical_merge_statement(
+                    existing['statement'],
+                    stmt,
+                )
+                self.brain.update_node(
+                    best_match_id,
+                    statement=merged_stmt,
+                    verification_count=(
+                        existing.get('verification_count', 0) + 1
+                    ),
+                    last_verified=time.time(),
+                    source_quality=max(existing.get('source_quality', 0.5), sq),
+                    source_ids=self._merge_unique_list(
+                        existing.get("source_ids", []),
+                        source_ids,
+                    ),
+                    source_refs=self._merge_unique_list(
+                        existing.get("source_refs", []),
+                        source_refs,
+                    ),
+                    provenance_spans=self._merge_provenance_spans(
+                        existing.get("provenance_spans", []),
+                        provenance_spans,
+                    ),
+                    extraction_confidence=max(
+                        float(existing.get("extraction_confidence", 0.0) or 0.0),
+                        extraction_confidence,
+                    ),
+                    created_by=created_by or existing.get("created_by", ""),
+                    epistemic_status=existing.get(
+                        "epistemic_status",
+                        self._epistemic_status_for(source, node_type),
+                    ),
+                )
+                enriched_emb = self._embed(merged_stmt)
+                self._embedding_cache[best_match_id] = enriched_emb
+                if self.index:
+                    self.index.add(best_match_id, enriched_emb)
+                # upgrade type if more specific
+                if (node_type == NodeType.HYPOTHESIS and
+                        existing.get('node_type') == NodeType.CONCEPT.value):
+                    self.brain.update_node(best_match_id,
+                        node_type        = NodeType.HYPOTHESIS.value,
+                        predicted_answer = predicted_answer,
+                        testable_by      = testable_by)
+                    print(f"  Upgraded to HYPOTHESIS")
+                else:
+                    print(f"  Canonically merged duplicate (sim={best_similarity:.2f})")
 
-        cluster = self._llm(
-            CLUSTER_PROMPT.format(statement=stmt)
-        ).strip().lower()
+                self._check_against_agenda(best_match_id, merged_stmt)
+                self._check_mission_relevance(best_match_id, merged_stmt)
+                return best_match_id
+
+        cluster = self._cluster_for_statement(stmt)
 
         # ── Contradiction detection (indexed or fallback) ──
         status = NodeStatus.UNCERTAIN
@@ -774,50 +1580,85 @@ class Ingestor:
             contra_candidates = self.index.query(
                 stmt_emb, threshold=0.45, top_k=15
             )
+            contradiction_checks = 0
             for cand_id, cand_sim in contra_candidates:
+                if contradiction_checks >= MAX_CONTRADICTION_LLM_CANDIDATES:
+                    break
                 node_data = self.brain.get_node(cand_id)
                 if not node_data:
                     continue
-                check = self._llm(CONTRADICTION_CHECK_PROMPT.format(
-                    existing=node_data['statement'],
-                    new=stmt
-                ), temperature=0.1)
-                if check.lower().startswith('yes'):
+                contradiction_checks += 1
+                if self._claims_contradict(node_data['statement'], stmt):
                     status = NodeStatus.CONTRADICTED
                     contradiction_ids.append(cand_id)
                     print(f"  Contradiction with {cand_id[:8]}")
         else:
+            contradiction_checks = 0
             for nid, nemb in existing_embeddings.items():
+                if contradiction_checks >= MAX_CONTRADICTION_LLM_CANDIDATES:
+                    break
                 if self._cosine(stmt_emb, nemb) > 0.45:
-                    check = self._llm(CONTRADICTION_CHECK_PROMPT.format(
-                        existing=self.brain.get_node(nid)['statement'],
-                        new=stmt
-                    ), temperature=0.1)
-                    if check.lower().startswith('yes'):
+                    existing = self.brain.get_node(nid)
+                    if not existing:
+                        continue
+                    contradiction_checks += 1
+                    if self._claims_contradict(existing['statement'], stmt):
                         status = NodeStatus.CONTRADICTED
                         contradiction_ids.append(nid)
                         print(f"  Contradiction with {nid[:8]}")
 
-        # Source quality mapping
-        source_quality_map = {
-            EdgeSource.READING:       0.9,
-            EdgeSource.RESEARCH:      0.8,
-            EdgeSource.CONVERSATION:  0.7,
-            EdgeSource.CONSOLIDATION: 0.6,
-            EdgeSource.SANDBOX:       0.7,
-            EdgeSource.DREAM:         0.3,
-        }
-        sq = source_quality_map.get(source, 0.5)
+        proposed_importance = self._candidate_importance(
+            node_type,
+            sq,
+            len(contradiction_ids),
+        )
+        epistemic_status = self._epistemic_status_for(
+            source,
+            node_type,
+            is_contradicted=bool(contradiction_ids),
+        )
+        review_context = self._build_review_context(
+            stmt_emb,
+            cluster,
+            source,
+            contradiction_ids,
+        )
+        reviewed_stmt, reviewed_importance, accepted = self._review_statement(
+            stmt,
+            node_type,
+            source,
+            proposed_importance,
+            review_context,
+            contradiction_ids,
+            source_ids=source_ids,
+            source_refs=source_refs,
+            expected_status=epistemic_status,
+        )
+        if not accepted:
+            return ""
+
+        if reviewed_stmt != stmt:
+            stmt = reviewed_stmt
+            stmt_emb = self._embed(stmt)
+            cluster = self._cluster_for_statement(stmt)
 
         node = Node(
             statement        = stmt,
             node_type        = node_type,
             cluster          = cluster,
             status           = status,
+            epistemic_status = epistemic_status,
+            importance       = reviewed_importance,
             predicted_answer = predicted_answer,
             testable_by      = testable_by,
-            source_quality   = sq,
-            last_verified    = time.time()
+            source_quality   = max(sq, reviewed_importance * 0.8),
+            verification_count = 1,
+            last_verified    = time.time(),
+            source_ids       = list(source_ids or []),
+            source_refs      = list(source_refs or []),
+            provenance_spans = list(provenance_spans or []),
+            extraction_confidence = extraction_confidence,
+            created_by       = created_by,
         )
         nid = self.brain.add_node(node)
         self._embedding_cache[nid] = stmt_emb
@@ -834,6 +1675,7 @@ class Ingestor:
                 decay_exempt = True
             )
             self.brain.add_edge(nid, contra_id, contra_edge)
+            self._escalate_contradiction(nid, contra_id)
 
         self._check_against_agenda(nid, stmt)
         self._check_mission_relevance(nid, stmt)
